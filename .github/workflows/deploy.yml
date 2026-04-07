@@ -1,0 +1,30 @@
+name: Pentora Backend Deploy
+
+on:
+  push:
+    branches: [ main ] # Sadece main branch'ine push yapınca çalışır
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to VDS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd ~/pentora-pay-backend
+            git pull origin main
+            
+            # Docker operasyonu
+            sudo docker build -t pentora-backend .
+            sudo docker rm -f pentora-api || true
+            
+            sudo docker run -d \
+              --name pentora-api \
+              -p 80:8080 \
+              -e POSTGRES_HOST=172.17.0.1 \
+              --restart always \
+              pentora-backend
