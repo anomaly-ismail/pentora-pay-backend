@@ -58,9 +58,9 @@ app = FastAPI(
         "Güvenli Ödeme Sistemi Backend API\n\n"
         "OWASP Top 10 ve ISO 27001 uyumlu güvenlik mimarisi."
     ),
-    docs_url="/docs" if not settings.is_production else None,
-    redoc_url="/redoc" if not settings.is_production else None,
-    openapi_url="/openapi.json" if not settings.is_production else None,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
     lifespan=lifespan,
 )
 
