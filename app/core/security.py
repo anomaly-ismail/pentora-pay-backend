@@ -1,0 +1,147 @@
+"""
+Güvenlik yardımcı araçları — HMAC imzalama, SQL enjeksiyon tespiti, token utils.
+OWASP A03 (Injection) ve OWASP A02 (Cryptographic Failures) kapsamında.
+"""
+import hashlib
+import hmac
+import re
+import time
+import uuid
+from typing import Optional
+
+from app.core.config import get_settings
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# X-Pentora-Signature — İstek bütünlük imzası
+# Format: HMAC-SHA256( timestamp + "." + method + "." + path + "." + body_hash )
+# ─────────────────────────────────────────────────────────────────────────────
+
+SIGNATURE_TOLERANCE_SECONDS = 300  # ±5 dakika replay koruması
+
+
+def generate_signature(
+    method: str,
+    path: str,
+    body: bytes,
+    timestamp: Optional[int] = None,
+    secret: Optional[str] = None,
+) -> tuple[str, int]:
+    """
+    İstek için HMAC-SHA256 imzası üretir.
+    Returns: (signature_hex, timestamp_used)
+    """
+    settings = get_settings()
+    ts = timestamp or int(time.time())
+    key = (secret or settings.pentora_signature_secret).encode()
+    body_hash = hashlib.sha256(body).hexdigest()
+    message = f"{ts}.{method.upper()}.{path}.{body_hash}".encode()
+    sig = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return sig, ts
+
+
+def verify_signature(
+    signature: str,
+    method: str,
+    path: str,
+    body: bytes,
+    timestamp: int,
+    secret: Optional[str] = None,
+) -> bool:
+    """HMAC-SHA256 imzasını ve zaman damgasını doğrular."""
+    now = int(time.time())
+    if abs(now - timestamp) > SIGNATURE_TOLERANCE_SECONDS:
+        logger.warning("signature.replay_attempt", ts=timestamp, now=now)
+        return False
+
+    expected, _ = generate_signature(method, path, body, timestamp, secret)
+    return hmac.compare_digest(expected, signature)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# X-Pentora-SQL — SQL Enjeksiyon Tespit Katmanı
+# OWASP A03: Injection
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Yaygın SQL enjeksiyon örüntüleri (heuristic, parameterized queries asıl koruma)
+_SQL_PATTERNS = re.compile(
+    r"""
+    (\b(SELECT|INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|EXEC|UNION|HAVING)\b)
+    | (--|;--|\/\*|\*\/)                    # SQL yorum kalıpları
+    | (\bOR\b\s+\d+\s*=\s*\d+)             # OR 1=1 tipi
+    | (\bAND\b\s+\d+\s*=\s*\d+)            # AND 1=1 tipi
+    | (\'.*?\'|\".*?\")                     # Tek/çift tırnak kombinasyonları
+    | (CAST\s*\(|CONVERT\s*\()             # Tip dönüşüm fonksiyonları
+    | (INFORMATION_SCHEMA|SYS\.|SYSOBJECTS) # Sistem tabloları
+    | (WAITFOR\s+DELAY|SLEEP\s*\()         # Time-based blind injection
+    | (XP_CMDSHELL|SP_EXECUTESQL)          # MSSQL tehlikeli prosedürler
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+class SQLScanResult:
+    __slots__ = ("detected", "pattern_count", "risk_level")
+
+    def __init__(self, detected: bool, pattern_count: int):
+        self.detected = detected
+        self.pattern_count = pattern_count
+        self.risk_level = _risk_level(pattern_count)
+
+    def to_header_value(self) -> str:
+        """X-Pentora-SQL header değeri üretir."""
+        if not self.detected:
+            return "CLEAN"
+        return f"DETECTED;count={self.pattern_count};risk={self.risk_level}"
+
+
+def _risk_level(count: int) -> str:
+    if count == 0:
+        return "NONE"
+    if count <= 1:
+        return "LOW"
+    if count <= 3:
+        return "MEDIUM"
+    return "HIGH"
+
+
+def scan_for_sql_injection(content: str) -> SQLScanResult:
+    """
+    Verilen içeriği SQL enjeksiyon örüntüleri için tarar.
+    NOT: Bu heuristik bir filtredir. Asıl koruma her zaman
+    parameterized query / ORM kullanımıdır.
+    """
+    if not content:
+        return SQLScanResult(False, 0)
+
+    matches = _SQL_PATTERNS.findall(content)
+    count = len(matches)
+    detected = count > 0
+
+    if detected:
+        logger.warning(
+            "sql_injection.pattern_detected",
+            pattern_count=count,
+            risk=_risk_level(count),
+        )
+
+    return SQLScanResult(detected, count)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Genel Yardımcılar
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_request_id() -> str:
+    """İzlenebilirlik için benzersiz istek kimliği üretir (OWASP A09)."""
+    return str(uuid.uuid4())
+
+
+def safe_compare(a: str, b: str) -> bool:
+    """Zamanlama saldırılarına karşı sabit-zamanlı karşılaştırma."""
+    return hmac.compare_digest(
+        a.encode("utf-8"),
+        b.encode("utf-8"),
+    )
