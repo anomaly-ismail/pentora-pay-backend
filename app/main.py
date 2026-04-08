@@ -29,10 +29,10 @@ async def lifespan(app: FastAPI):
     # Kriptografik ortam öz-testi — hata varsa başlatmayı durdur
     assert_crypto_environment()
 
-    # Geliştirme ortamında veritabanı tablolarını oluştur
-    if settings.app_env != "production":
-        from app.db.engine import create_all_tables
-        await create_all_tables()
+    # Tüm ortamlarda eksik tabloları oluştur (CREATE TABLE IF NOT EXISTS — idempotent, güvenli)
+    # Var olan tablolara ve veriye dokunmaz; yalnızca eksik olanları ekler.
+    from app.db.engine import create_all_tables
+    await create_all_tables()
 
     logger.info(
         "app.started",
