@@ -51,6 +51,7 @@ _BYPASS_PATHS = frozenset({
     "/redoc",
     "/openapi.json",
     "/api/v1/auth/handshake",   # Handshake başlatma — session yok, bypass
+    "/api/v1/admin/sso/login",  # Admin SSO Giriş — Tarayıcı tabanlı, bypass
 })
 
 _FLUTTER_UA_KEYWORDS = ("Dart/", "dart:", "Flutter/")

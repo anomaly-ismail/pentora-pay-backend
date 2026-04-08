@@ -244,7 +244,7 @@ def _apply_pentora_signature(
 def _perform_sql_scan(request: Request, body: bytes) -> object:
     """İstek URL, query string ve gövdesini SQL enjeksiyon örüntüleri için tarar."""
     settings = get_settings()
-    if not settings.pentora_sql_guard_enabled:
+    if not settings.pentora_sql_guard_enabled or request.url.path == "/api/v1/admin/sso/login":
         from app.core.security import SQLScanResult
         return SQLScanResult(False, 0)
 
