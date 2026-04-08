@@ -72,6 +72,7 @@ async def create_all_tables() -> None:
     import app.models.corporate_application  # noqa: F401
     import app.models.notification  # noqa: F401
     import app.models.user_device  # noqa: F401
+    import app.models.web_corporate_application  # noqa: F401
 
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -79,6 +80,17 @@ async def create_all_tables() -> None:
         await conn.exec_driver_sql(
             "ALTER TABLE corporate_applications "
             "ADD COLUMN IF NOT EXISTS applicant_tckn VARCHAR(11)"
+        )
+        await conn.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS web_corporate_applications ("
+            "id UUID PRIMARY KEY DEFAULT gen_random_uuid(),"
+            "first_name VARCHAR(80) NOT NULL,"
+            "last_name VARCHAR(80) NOT NULL,"
+            "city VARCHAR(80) NOT NULL,"
+            "phone VARCHAR(20) NOT NULL,"
+            "kvkk_approved BOOLEAN NOT NULL DEFAULT FALSE,"
+            "submitted_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ")"
         )
     logger.info("db.tables.created")
 

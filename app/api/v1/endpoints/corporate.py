@@ -28,7 +28,13 @@ from app.schemas.corporate_application import (
     CorporateApplicationResponse,
     CorporateApplicationStatusUpdate,
 )
+from app.schemas.web_corporate_application import (
+    WebCorporateApplicationCreate,
+    WebCorporateApplicationListResponse,
+    WebCorporateApplicationResponse,
+)
 from app.services import corporate_application_service as svc
+from app.services import web_corporate_application_service as web_svc
 from app.repositories.corporate_application_repo import CorporateApplicationRepo
 
 logger = get_logger(__name__)
@@ -121,6 +127,20 @@ async def submit_corporate_application(
     }
 
 
+@flutter_router.post(
+    "/web-apply",
+    status_code=status.HTTP_201_CREATED,
+    response_model=WebCorporateApplicationResponse,
+    summary="Web Kurumsal Başvuru Formu",
+    description="Kurumsal landing sayfasındaki kısa formdan başvuru alır.",
+)
+async def submit_web_corporate_application(
+    body: WebCorporateApplicationCreate,
+    db: AsyncSession = Depends(get_db),
+) -> WebCorporateApplicationResponse:
+    return await web_svc.submit_web_application(session=db, payload=body)
+
+
 # ─── Admin: Başvuruları Listele ───────────────────────────────────────────────
 @admin_corp_router.get(
     "/applications",
@@ -138,6 +158,24 @@ async def list_corporate_applications(
         session=db,
         status_filter=status_filter,
         limit=min(limit, 100),
+        offset=offset,
+    )
+
+
+@admin_corp_router.get(
+    "/web-applications",
+    response_model=WebCorporateApplicationListResponse,
+    summary="Web Kurumsal Başvuru Listesi",
+)
+async def list_web_corporate_applications(
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin_jwt),
+) -> WebCorporateApplicationListResponse:
+    return await web_svc.list_web_applications(
+        session=db,
+        limit=min(limit, 200),
         offset=offset,
     )
 
