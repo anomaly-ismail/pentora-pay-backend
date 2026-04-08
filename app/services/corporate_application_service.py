@@ -22,6 +22,7 @@ from app.models.notification import NotificationType
 from app.models.user import User
 from app.repositories.corporate_application_repo import CorporateApplicationRepo
 from app.repositories.notification_repo import NotificationRepo
+from app.services.push_notification_service import send_user_push
 from app.schemas.corporate_application import (
     CorporateApplicationCreate,
     CorporateApplicationListResponse,
@@ -236,6 +237,13 @@ async def update_application_status(
             body=body,
             notification_type=status_type_map.get(app.status, NotificationType.SYSTEM),
             related_id=str(app.id),
+        )
+        await send_user_push(
+            db=session,
+            user_id=app.user_id,
+            title=status_title_map.get(app.status, "Kurumsal basvuru guncellendi"),
+            body=body,
+            data={"related_id": str(app.id), "status": app.status},
         )
 
     await session.commit()

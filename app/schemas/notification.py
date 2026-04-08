@@ -33,3 +33,8 @@ class NotificationListResponse(BaseModel):
 class NotificationMarkReadRequest(BaseModel):
     """Toplu okundu işaretleme isteği (opsiyonel liste)."""
     ids: Optional[list[uuid.UUID]] = None  # None ise tümü
+
+
+class DeviceTokenRegisterRequest(BaseModel):
+    token: str
+    platform: str = "android"

@@ -8,7 +8,12 @@ from app.api.dependencies import get_current_user
 from app.db.dependencies import get_db
 from app.models.user import User
 from app.repositories.notification_repo import NotificationRepo
-from app.schemas.notification import NotificationListResponse, NotificationResponse
+from app.repositories.user_device_repo import UserDeviceRepo
+from app.schemas.notification import (
+    DeviceTokenRegisterRequest,
+    NotificationListResponse,
+    NotificationResponse,
+)
 
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
 
@@ -56,3 +61,22 @@ async def mark_all_notifications_read(
     count = await repo.mark_all_read(user.id)
     await db.commit()
     return {"updated": int(count or 0)}
+
+
+@router.post("/device-token", summary="Push cihaz token kaydı")
+async def register_device_token(
+    body: DeviceTokenRegisterRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    token = body.token.strip()
+    if len(token) < 20:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Gecersiz cihaz tokeni")
+    platform = (body.platform or "android").strip().lower()
+    if platform not in {"android", "ios", "web"}:
+        platform = "android"
+
+    repo = UserDeviceRepo(db)
+    await repo.upsert_token(user_id=user.id, platform=platform, token=token)
+    await db.commit()
+    return {"ok": True}

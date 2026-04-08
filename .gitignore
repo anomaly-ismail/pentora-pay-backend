@@ -7,6 +7,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+pentora-pay-firebase-adminsdk-fbsvc-ea94983dab.json
 
 # Ortam değişkenleri — ASLA commit etme
 .env

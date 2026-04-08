@@ -82,6 +82,9 @@ class Settings(BaseSettings):
     paytr_merchant_key: str = ""
     paytr_merchant_salt: str = ""
 
+    # ── Push Notifications (Firebase Admin SDK) ───────────────────────────────
+    firebase_service_account_file: str = "pentora-pay-firebase-adminsdk-fbsvc-ea94983dab.json"
+
     # ── Validators ──────────────────────────────────────────────────────────────
 
     @field_validator("pentora_signature_secret", "pentora_grauth_secret", "tckn_pepper")
