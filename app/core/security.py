@@ -113,6 +113,27 @@ _SQL_BYPASS_PATHS: frozenset[str] = frozenset({
     "/api/v1/corporate/apply",     # multipart/form-data — binary PDF/PNG içerir, taranamaz
 })
 
+# Prefix tabanlı bypass'lar (örn: büyük dosya upload endpoint'leri)
+_SQL_BYPASS_PREFIXES: tuple[str, ...] = (
+    "/api/v1/corporate/apply",     # yedek olarak prefix bazlı eklendi
+)
+
+
+def is_sql_injection_bypassed(path: str) -> bool:
+    """Verilen path'in SQL taramasından muaf olup olmadığını kontrol eder."""
+    if not path:
+        return False
+    
+    # Tam eşleşme kontrolü
+    if path in _SQL_BYPASS_PATHS:
+        return True
+        
+    # Prefix kontrolü
+    if any(path.startswith(p) for p in _SQL_BYPASS_PREFIXES):
+        return True
+        
+    return False
+
 
 def scan_for_sql_injection(content: str, path: str = "") -> SQLScanResult:
     """
@@ -124,7 +145,7 @@ def scan_for_sql_injection(content: str, path: str = "") -> SQLScanResult:
         content: Taranacak metin içeriği
         path   : İsteğin URL path'i; bypass listesindeyse tarama atlanır
     """
-    if not content or path in _SQL_BYPASS_PATHS:
+    if not content or is_sql_injection_bypassed(path):
         return SQLScanResult(False, 0)
 
     matches = _SQL_PATTERNS.findall(content)

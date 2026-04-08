@@ -59,17 +59,26 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         t0 = time.perf_counter()
 
         # multipart/form-data body'sini ASLA okuma — multipart parser'ı bozar
-        content_type = request.headers.get("content-type", "")
+        content_type = request.headers.get("content-type", "").lower()
         is_multipart = "multipart/form-data" in content_type or "application/octet-stream" in content_type
 
-        if is_multipart:
-            body = b""  # Binary body taranmaz, boş geç
+        # SQL Guard Bypass kontrolü (body okumadan önce)
+        path = str(request.url.path)
+        from app.core.security import is_sql_injection_bypassed
+        is_bypassed = is_sql_injection_bypassed(path)
+
+        if is_multipart or is_bypassed:
+            body = b""  # Binary veya muaf path'ler taranmaz, boş geç
         else:
             # İstek gövdesini oku (imza ve SQL taraması için)
             body = await request.body()
 
         # ── [D] SQL Taraması ────────────────────────────────────────────────
-        sql_scan_result = _perform_sql_scan(request, body)
+        if is_bypassed:
+            from app.core.security import SQLScanResult
+            sql_scan_result = SQLScanResult(False, 0)
+        else:
+            sql_scan_result = _perform_sql_scan(request, body)
 
         # İsteği işle
         response: Response = await call_next(request)
@@ -266,7 +275,7 @@ def _perform_sql_scan(request: Request, body: bytes) -> object:
 
     # Binary olmayan body'leri de tara
     if body:
-        content_type = request.headers.get("content-type", "")
+        content_type = request.headers.get("content-type", "").lower()
         is_binary = (
             "multipart" in content_type
             or "octet-stream" in content_type
