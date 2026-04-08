@@ -64,6 +64,11 @@ _BYPASS_PREFIXES = (
 )
 
 _FLUTTER_UA_KEYWORDS = ("Dart/", "dart:", "Flutter/")
+_WEB_APPLY_PATH = "/api/v1/corporate/web-apply"
+_WEB_ALLOWED_ORIGINS = frozenset({
+    "https://pay.pentorasec.com.tr",
+    "https://www.pay.pentorasec.com.tr",
+})
 
 
 class ClientAuthMiddleware(BaseHTTPMiddleware):
@@ -82,6 +87,11 @@ class ClientAuthMiddleware(BaseHTTPMiddleware):
 
         # Prefix tabanlı bypass (örn: tüm /api/v1/admin/corporate/* rotaları)
         if any(request.url.path.startswith(prefix) for prefix in _BYPASS_PREFIXES):
+            return await call_next(request)
+
+        # Web landing formu (tarayıcı tabanlı) için kontrollü bypass.
+        # Yalnızca tek endpoint + izinli origin + browser UA kabul edilir.
+        if _is_allowed_web_form_request(request):
             return await call_next(request)
 
         if not self.settings.flutter_client_auth_enabled:
@@ -145,6 +155,22 @@ class ClientAuthMiddleware(BaseHTTPMiddleware):
 
 def _is_flutter_agent(ua: str) -> bool:
     return bool(ua) and any(kw in ua for kw in _FLUTTER_UA_KEYWORDS)
+
+
+def _is_allowed_web_form_request(request: Request) -> bool:
+    if request.url.path != _WEB_APPLY_PATH:
+        return False
+    if request.method not in ("POST", "OPTIONS"):
+        return False
+
+    origin = request.headers.get("origin", "")
+    if origin not in _WEB_ALLOWED_ORIGINS:
+        return False
+
+    user_agent = request.headers.get("user-agent", "")
+    if _is_flutter_agent(user_agent):
+        return False
+    return "Mozilla/" in user_agent
 
 
 def _reject(request: Request, reason: str, message: str) -> JSONResponse:
