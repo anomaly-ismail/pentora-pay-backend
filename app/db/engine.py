@@ -70,9 +70,15 @@ async def create_all_tables() -> None:
     import app.models.user_session  # noqa: F401
     import app.models.audit_event   # noqa: F401
     import app.models.corporate_application  # noqa: F401
+    import app.models.notification  # noqa: F401
 
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Geriye dönük uyumluluk: mevcut tabloda yeni kolonlar eksikse ekle
+        await conn.exec_driver_sql(
+            "ALTER TABLE corporate_applications "
+            "ADD COLUMN IF NOT EXISTS applicant_tckn VARCHAR(11)"
+        )
     logger.info("db.tables.created")
 
 

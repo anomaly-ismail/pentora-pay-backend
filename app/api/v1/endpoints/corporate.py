@@ -20,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.dependencies import get_db
+from app.api.dependencies import get_current_user_optional
+from app.models.user import User
 from app.schemas.corporate_application import (
     CorporateApplicationCreate,
     CorporateApplicationListResponse,
@@ -77,6 +79,7 @@ async def submit_corporate_application(
     tax_office:     str = Form(...),
     address:        str = Form(...),
     applicant_name: str = Form(...),
+    applicant_tckn: Optional[str] = Form(None),
     phone:          str = Form(...),
     mersis_no:      Optional[str] = Form(None),
     # Dosyalar
@@ -84,6 +87,7 @@ async def submit_corporate_application(
     imza_sirkuleri: UploadFile = File(..., description="İmza sirküleri (PDF/JPG/PNG, maks 5MB)"),
     ticaret_sicil:  UploadFile = File(..., description="Ticaret sicil gazetesi (PDF/JPG/PNG, maks 5MB)"),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ) -> dict:
     form_data = CorporateApplicationCreate(
         company_name=company_name,
@@ -92,6 +96,7 @@ async def submit_corporate_application(
         mersis_no=mersis_no,
         address=address,
         applicant_name=applicant_name,
+        applicant_tckn=applicant_tckn,
         phone=phone,
     )
 
@@ -102,6 +107,13 @@ async def submit_corporate_application(
         imza_sirkuleri=imza_sirkuleri,
         ticaret_sicil=ticaret_sicil,
     )
+    if current_user is not None:
+        await svc.attach_user_to_application(
+            session=db,
+            application_id=application.id,
+            user_id=current_user.id,
+        )
+        await db.commit()
     return {
         "message": "Başvurunuz alındı. 24 saat içinde sizinle iletişime geçilecektir.",
         "application_id": str(application.id),
@@ -145,7 +157,11 @@ async def get_corporate_application(
     app = await repo.get_by_id(app_id)
     if not app:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Başvuru bulunamadı")
-    return CorporateApplicationResponse.from_orm_with_docs(app)
+    tckn_hash = None
+    if app.user_id:
+        user = await db.get(User, app.user_id)
+        tckn_hash = user.tckn_hash if user else None
+    return CorporateApplicationResponse.from_orm_with_docs(app, tckn_hash=tckn_hash)
 
 
 # ─── Admin: Durum Güncelle ────────────────────────────────────────────────────

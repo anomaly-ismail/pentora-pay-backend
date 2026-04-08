@@ -18,6 +18,7 @@ from enum import StrEnum
 from sqlalchemy import DateTime, Index, String, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
+from typing import Optional
 
 from app.db.base import Base
 
@@ -38,6 +39,16 @@ class CorporateApplication(Base):
         primary_key=True,
         default=uuid.uuid4,
         server_default=text("gen_random_uuid()"),
+    )
+
+    # ── Başvuruyu Yapan Kullanıcı (nullable — backwardcompat) ───────────────
+    # Flutter'dan gelen GRAuth token çözülünce doldurulur.
+    # Eski başvurular NULL kalır — bu güvenlidir.
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+        comment="Başvuruyu yapan kullanıcı UUID — GRAuth'dan çözülür, nullable",
     )
 
     # ── Başvuru Durumu ────────────────────────────────────────────────────────
@@ -86,6 +97,12 @@ class CorporateApplication(Base):
         String(150),
         nullable=False,
         comment="Başvuran kişi adı soyadı",
+    )
+
+    applicant_tckn: Mapped[str | None] = mapped_column(
+        String(11),
+        nullable=True,
+        comment="Başvuran kişinin TCKN değeri (admin doğrulama için)",
     )
 
     phone: Mapped[str] = mapped_column(

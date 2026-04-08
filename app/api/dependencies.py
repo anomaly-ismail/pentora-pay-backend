@@ -14,6 +14,7 @@ from app.core.config import get_settings
 
 logger = get_logger(__name__)
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
 
 async def get_current_user(
     request: Request,
@@ -65,3 +66,20 @@ async def get_current_user(
         )
 
     return user_session.user
+
+
+async def get_current_user_optional(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
+    db: AsyncSession = Depends(get_db),
+) -> User | None:
+    """
+    Opsiyonel kullanıcı çözümleme.
+    Authorization yoksa None döner; varsa token doğrulamaya çalışır.
+    """
+    if credentials is None:
+        return None
+    try:
+        return await get_current_user(request=request, credentials=credentials, db=db)
+    except HTTPException:
+        return None

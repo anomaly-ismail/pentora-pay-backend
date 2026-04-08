@@ -1,23 +1,21 @@
 """
-Güvenlik yardımcı araçları — HMAC imzalama, SQL enjeksiyon tespiti, token utils.
-OWASP A03 (Injection) ve OWASP A02 (Cryptographic Failures) kapsamında.
+Güvenlik yardımcı araçları — HMAC imzalama, SQL enjeksiyon heuristics, güvenli kıyaslama.
+OWASP A02 (Cryptographic Failures) ve OWASP A03 (Injection) prensiplerine göre.
 """
+from __future__ import annotations
+
 import hashlib
 import hmac
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Optional
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# X-Pentora-Signature — İstek bütünlük imzası
-# Format: HMAC-SHA256( timestamp + "." + method + "." + path + "." + body_hash )
-# ─────────────────────────────────────────────────────────────────────────────
 
 SIGNATURE_TOLERANCE_SECONDS = 300  # ±5 dakika replay koruması
 
@@ -29,15 +27,12 @@ def generate_signature(
     timestamp: Optional[int] = None,
     secret: Optional[str] = None,
 ) -> tuple[str, int]:
-    """
-    İstek için HMAC-SHA256 imzası üretir.
-    Returns: (signature_hex, timestamp_used)
-    """
+    """İstek/yanıt için HMAC-SHA256 imzası üretir."""
     settings = get_settings()
     ts = timestamp or int(time.time())
-    key = (secret or settings.pentora_signature_secret).encode()
+    key = (secret or settings.pentora_signature_secret).encode("utf-8")
     body_hash = hashlib.sha256(body).hexdigest()
-    message = f"{ts}.{method.upper()}.{path}.{body_hash}".encode()
+    message = f"{ts}.{method.upper()}.{path}.{body_hash}".encode("utf-8")
     sig = hmac.new(key, message, hashlib.sha256).hexdigest()
     return sig, ts
 
@@ -50,7 +45,7 @@ def verify_signature(
     timestamp: int,
     secret: Optional[str] = None,
 ) -> bool:
-    """HMAC-SHA256 imzasını ve zaman damgasını doğrular."""
+    """İmza + zaman damgası doğrulaması yapar."""
     now = int(time.time())
     if abs(now - timestamp) > SIGNATURE_TOLERANCE_SECONDS:
         logger.warning("signature.replay_attempt", ts=timestamp, now=now)
@@ -60,40 +55,82 @@ def verify_signature(
     return hmac.compare_digest(expected, signature)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# X-Pentora-SQL — SQL Enjeksiyon Tespit Katmanı
-# OWASP A03: Injection NOT: SADECE TEST İÇİN KONULMUŞTUR
-# ─────────────────────────────────────────────────────────────────────────────
-import uuid
-import hmac
-import hashlib
-import time
-# Yaygın SQL enjeksiyon örüntüleri (heuristic, parameterized queries asıl koruma)
+@dataclass
 class SQLScanResult:
-    def __init__(self, detected: bool = False, pattern_count: int = 0):
-        self.detected = detected
-        self.pattern_count = pattern_count
-        self.risk_level = "NONE"
+    detected: bool = False
+    pattern_count: int = 0
+    risk_level: str = "NONE"
+
     def to_header_value(self) -> str:
-        return "CLEAN"
+        if not self.detected:
+            return "CLEAN"
+        return f"{self.risk_level}:{self.pattern_count}"
 
-# 1. Fonksiyon: SQL Taramasını bypass eden ana fonksiyon
-def scan_for_sql_injection(content: str, path: str = "") -> SQLScanResult:
-    return SQLScanResult(False, 0)
 
-# 2. Fonksiyon: İŞTE BU EKSİKTİ! Middleware bunu arıyor:
+_SQL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)\bunion\s+select\b"),
+    re.compile(r"(?i)\bdrop\s+table\b"),
+    re.compile(r"(?i)\binsert\s+into\b"),
+    re.compile(r"(?i)\bdelete\s+from\b"),
+    re.compile(r"(?i)\bupdate\s+\w+\s+set\b"),
+    re.compile(r"(?i)\bor\s+1\s*=\s*1\b"),
+    re.compile(r"(?i)['\"];?\s*--"),
+    re.compile(r"(?i)/\*.*?\*/"),
+    re.compile(r"(?i)\bbenchmark\s*\("),
+    re.compile(r"(?i)\bsleep\s*\("),
+)
+
+_SQL_BYPASS_PATH_PREFIXES: tuple[str, ...] = (
+    "/api/v1/auth/handshake",
+    "/health",
+    "/ping",
+)
+
+
 def is_sql_injection_bypassed(path: str) -> bool:
-    # 20. saatin şerefine her şeyi bypass et kanka!
-    return True
+    """Performans/kritik path'ler için SQL heuristics taramayı bypass eder."""
+    return any(path.startswith(prefix) for prefix in _SQL_BYPASS_PATH_PREFIXES)
 
-# 3. Fonksiyon: İmza doğrulamayı bypass et
-def verify_signature(*args, **kwargs) -> bool:
-    return True
 
-# 4. Fonksiyon: Request ID üretici
+def scan_for_sql_injection(content: str, path: str = "") -> SQLScanResult:
+    """
+    Heuristic SQL pattern taraması.
+    Not: Parametrik sorgu kullanımı asıl korumadır; bu katman ilave erken uyarıdır.
+    """
+    if is_sql_injection_bypassed(path):
+        return SQLScanResult(False, 0, "NONE")
+
+    haystack = (content or "")[:200_000]  # performans sınırı
+    if not haystack:
+        return SQLScanResult(False, 0, "NONE")
+
+    count = 0
+    for rx in _SQL_PATTERNS:
+        if rx.search(haystack):
+            count += 1
+
+    if count == 0:
+        return SQLScanResult(False, 0, "NONE")
+
+    if count >= 4:
+        risk = "HIGH"
+    elif count >= 2:
+        risk = "MEDIUM"
+    else:
+        risk = "LOW"
+
+    logger.warning(
+        "sql_injection.pattern_detected",
+        pattern_count=count,
+        risk=risk,
+        path=path,
+    )
+    return SQLScanResult(True, count, risk)
+
+
 def generate_request_id() -> str:
     return str(uuid.uuid4())
 
-# 5. Fonksiyon: Admin girişi için gereken karşılaştırma
+
 def safe_compare(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))

@@ -14,10 +14,14 @@ import uuid
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.corporate_application import CorporateApplication
+from app.models.notification import NotificationType
+from app.models.user import User
 from app.repositories.corporate_application_repo import CorporateApplicationRepo
+from app.repositories.notification_repo import NotificationRepo
 from app.schemas.corporate_application import (
     CorporateApplicationCreate,
     CorporateApplicationListResponse,
@@ -48,19 +52,14 @@ async def _save_file(upload: UploadFile, subfolder: str) -> str:
     - UUID ile yeniden adlandırma
     Returns: disk yolu (string)
     """
-    content = await upload.read()
-
-    # Boyut kontrolü
-    if len(content) > _MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Dosya boyutu 5 MB sınırını aşıyor: {upload.filename}",
-        )
+    # İlk 16 byte: magic bytes kontrolü
+    await upload.seek(0)
+    head = await upload.read(16)
 
     # Magic bytes doğrulaması
     matched_ext = None
     for mime, magic in _ALLOWED_TYPES.items():
-        if content.startswith(magic):
+        if head.startswith(magic):
             matched_ext = mime.split("/")[1].replace("jpeg", "jpg")
             break
 
@@ -76,8 +75,25 @@ async def _save_file(upload: UploadFile, subfolder: str) -> str:
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / safe_name
 
-    target_path.write_bytes(content)
-    logger.info("corporate.file.saved", path=str(target_path), size=len(content))
+    # Stream ederek diske yaz (RAM kullanımı düşük, büyük dosyada daha hızlı)
+    await upload.seek(0)
+    size = 0
+    with target_path.open("wb") as f:
+        while True:
+            chunk = await upload.read(1024 * 1024)  # 1MB
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > _MAX_FILE_SIZE:
+                f.close()
+                target_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Dosya boyutu 5 MB sınırını aşıyor: {upload.filename}",
+                )
+            f.write(chunk)
+
+    logger.info("corporate.file.saved", path=str(target_path), size=size)
 
     return str(target_path)
 
@@ -102,12 +118,14 @@ async def submit_application(
     try:
         repo = CorporateApplicationRepo(session)
         application = await repo.create(
+            user_id=None,  # endpoint katmanı bu değeri ayrı günceller
             company_name=form_data.company_name,
             tax_number=form_data.tax_number,
             tax_office=form_data.tax_office,
             mersis_no=form_data.mersis_no,
             address=form_data.address,
             applicant_name=form_data.applicant_name,
+            applicant_tckn=form_data.applicant_tckn,
             phone=form_data.phone,
             vergi_levhasi_path=vergi_path,
             imza_sirkuleri_path=imza_path,
@@ -134,6 +152,20 @@ async def submit_application(
     return application
 
 
+async def attach_user_to_application(
+    *,
+    session: AsyncSession,
+    application_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> None:
+    repo = CorporateApplicationRepo(session)
+    app = await repo.get_by_id(application_id)
+    if not app:
+        return
+    app.user_id = user_id
+    await session.flush()
+
+
 async def list_applications(
     *,
     session: AsyncSession,
@@ -144,9 +176,23 @@ async def list_applications(
     """Admin için başvuru listesi."""
     repo = CorporateApplicationRepo(session)
     total, apps = await repo.get_all(status=status_filter, limit=limit, offset=offset)
+    user_hash_map: dict[uuid.UUID, str] = {}
+    user_ids = [a.user_id for a in apps if a.user_id]
+    if user_ids:
+        result = await session.execute(
+            select(User.id, User.tckn_hash).where(User.id.in_(user_ids))
+        )
+        user_hash_map = {row[0]: row[1] for row in result.all()}
+
     return CorporateApplicationListResponse(
         total=total,
-        applications=[CorporateApplicationResponse.from_orm_with_docs(a) for a in apps],
+        applications=[
+            CorporateApplicationResponse.from_orm_with_docs(
+                a,
+                tckn_hash=user_hash_map.get(a.user_id) if a.user_id else None,
+            )
+            for a in apps
+        ],
     )
 
 
@@ -164,5 +210,37 @@ async def update_application_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Başvuru bulunamadı.",
         )
+    if app.user_id:
+        notif_repo = NotificationRepo(session)
+        status_title_map = {
+            "approved": "Kurumsal başvurunuz onaylandı",
+            "rejected": "Kurumsal başvurunuz reddedildi",
+            "reviewing": "Kurumsal başvurunuz incelemede",
+            "pending": "Kurumsal başvurunuz beklemeye alındı",
+        }
+        status_type_map = {
+            "approved": NotificationType.CORPORATE_APPROVED,
+            "rejected": NotificationType.CORPORATE_REJECTED,
+            "reviewing": NotificationType.CORPORATE_REVIEWING,
+            "pending": NotificationType.SYSTEM,
+        }
+        note = (update.reviewer_note or "").strip()
+        base_body = (
+            f"Basvuru durumunuz: {app.status}. "
+            f"Basvuru No: {app.id}."
+        )
+        body = f"{base_body} Inceleme notu: {note}" if note else base_body
+        await notif_repo.create(
+            user_id=app.user_id,
+            title=status_title_map.get(app.status, "Kurumsal basvuru guncellendi"),
+            body=body,
+            notification_type=status_type_map.get(app.status, NotificationType.SYSTEM),
+            related_id=str(app.id),
+        )
+
     await session.commit()
-    return CorporateApplicationResponse.from_orm_with_docs(app)
+    tckn_hash = None
+    if app.user_id:
+        user = await session.get(User, app.user_id)
+        tckn_hash = user.tckn_hash if user else None
+    return CorporateApplicationResponse.from_orm_with_docs(app, tckn_hash=tckn_hash)
