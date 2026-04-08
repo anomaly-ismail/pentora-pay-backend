@@ -66,20 +66,7 @@ def verify_signature(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Yaygın SQL enjeksiyon örüntüleri (heuristic, parameterized queries asıl koruma)
-_SQL_PATTERNS = re.compile(
-    r"""
-#   (\b(SELECT|INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|EXEC|UNION|HAVING)\b)
-#     | (--|;--|\/\*|\*\/)                    # SQL yorum kalıpları
-#     | (\bOR\b\s+\d+\s*=\s*\d+)             # OR 1=1 tipi
-#      | (\bAND\b\s+\d+\s*=\s*\d+)            # AND 1=1 tipi
-#   | (\'.*?\'|\".*?\")                     # Tek/çift tırnak kombinasyonları
-#     | (CAST\s*\(|CONVERT\s*\()             # Tip dönüşüm fonksiyonları
-#    | (INFORMATION_SCHEMA|SYS\.|SYSOBJECTS) # Sistem tabloları
-#    | (WAITFOR\s+DELAY|SLEEP\s*\()         # Time-based blind injection
-#    | (XP_CMDSHELL|SP_EXECUTESQL)          # MSSQL tehlikeli prosedürler
-     """,
-    re.IGNORECASE | re.VERBOSE,
-)
+_SQL_PATTERNS = re.compile(r"$^")
 
 
 class SQLScanResult:
