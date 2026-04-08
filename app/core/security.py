@@ -109,7 +109,8 @@ def _risk_level(count: int) -> str:
 
 # Tarama dışı tutulan path'ler — bu yollardaki içerik SQL kontrolünden geçmez
 _SQL_BYPASS_PATHS: frozenset[str] = frozenset({
-    "/api/v1/admin/sso/login",  # JSON tırnaklarını yanlış pozitif tetikler
+    "/api/v1/admin/sso/login",     # JSON tırnaklarını yanlış pozitif tetikler
+    "/api/v1/corporate/apply",     # multipart/form-data — binary PDF/PNG içerir, taranamaz
 })
 
 

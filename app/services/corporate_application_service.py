@@ -91,6 +91,7 @@ async def submit_application(
     ticaret_sicil:  UploadFile,
 ) -> CorporateApplication:
     """Flutter'dan gelen başvuruyu kaydeder."""
+    from sqlalchemy.exc import SQLAlchemyError
 
     # Belgeleri diske kaydet
     app_folder = uuid.uuid4().hex  # Her başvuruya özel klasör
@@ -98,20 +99,32 @@ async def submit_application(
     imza_path   = await _save_file(imza_sirkuleri, f"{app_folder}/imza")
     sicil_path  = await _save_file(ticaret_sicil,  f"{app_folder}/sicil")
 
-    repo = CorporateApplicationRepo(session)
-    application = await repo.create(
-        company_name=form_data.company_name,
-        tax_number=form_data.tax_number,
-        tax_office=form_data.tax_office,
-        mersis_no=form_data.mersis_no,
-        address=form_data.address,
-        applicant_name=form_data.applicant_name,
-        phone=form_data.phone,
-        vergi_levhasi_path=vergi_path,
-        imza_sirkuleri_path=imza_path,
-        ticaret_sicil_path=sicil_path,
-    )
-    await session.commit()
+    try:
+        repo = CorporateApplicationRepo(session)
+        application = await repo.create(
+            company_name=form_data.company_name,
+            tax_number=form_data.tax_number,
+            tax_office=form_data.tax_office,
+            mersis_no=form_data.mersis_no,
+            address=form_data.address,
+            applicant_name=form_data.applicant_name,
+            phone=form_data.phone,
+            vergi_levhasi_path=vergi_path,
+            imza_sirkuleri_path=imza_path,
+            ticaret_sicil_path=sicil_path,
+        )
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        logger.error(
+            "corporate.application.db_error",
+            error=str(exc),
+            hint="corporate_applications tablosu DB'de mevcut olmayabilir — backend yeniden başlatın",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Başvuru kaydedilemedi. Lütfen daha sonra tekrar deneyin.",
+        ) from exc
 
     logger.info(
         "corporate.application.submitted",
