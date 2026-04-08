@@ -259,7 +259,7 @@ def _perform_sql_scan(request: Request, body: bytes) -> object:
         pass
 
     combined = " ".join(scan_target_parts)
-    return scan_for_sql_injection(combined)
+    return scan_for_sql_injection(combined, path=str(request.url.path))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

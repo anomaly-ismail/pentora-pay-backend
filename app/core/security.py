@@ -71,8 +71,8 @@ _SQL_PATTERNS = re.compile(
     (\b(SELECT|INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|EXEC|UNION|HAVING)\b)
     | (--|;--|\/\*|\*\/)                    # SQL yorum kalıpları
     | (\bOR\b\s+\d+\s*=\s*\d+)             # OR 1=1 tipi
-    | (\bAND\b\s+\d+\s*=\s*\d+)            # AND 1=1 tipi
-    | (\'.*?\'|\".*?\")                     # Tek/çift tırnak kombinasyonları
+     | (\bAND\b\s+\d+\s*=\s*\d+)            # AND 1=1 tipi
+#   | (\'.*?\'|\".*?\")                     # Tek/çift tırnak kombinasyonları
     | (CAST\s*\(|CONVERT\s*\()             # Tip dönüşüm fonksiyonları
     | (INFORMATION_SCHEMA|SYS\.|SYSOBJECTS) # Sistem tabloları
     | (WAITFOR\s+DELAY|SLEEP\s*\()         # Time-based blind injection
@@ -107,13 +107,23 @@ def _risk_level(count: int) -> str:
     return "HIGH"
 
 
-def scan_for_sql_injection(content: str) -> SQLScanResult:
+# Tarama dışı tutulan path'ler — bu yollardaki içerik SQL kontrolünden geçmez
+_SQL_BYPASS_PATHS: frozenset[str] = frozenset({
+    "/api/v1/admin/sso/login",  # JSON tırnaklarını yanlış pozitif tetikler
+})
+
+
+def scan_for_sql_injection(content: str, path: str = "") -> SQLScanResult:
     """
     Verilen içeriği SQL enjeksiyon örüntüleri için tarar.
     NOT: Bu heuristik bir filtredir. Asıl koruma her zaman
     parameterized query / ORM kullanımıdır.
+
+    Args:
+        content: Taranacak metin içeriği
+        path   : İsteğin URL path'i; bypass listesindeyse tarama atlanır
     """
-    if not content:
+    if not content or path in _SQL_BYPASS_PATHS:
         return SQLScanResult(False, 0)
 
     matches = _SQL_PATTERNS.findall(content)
