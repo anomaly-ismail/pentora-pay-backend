@@ -54,6 +54,11 @@ _BYPASS_PATHS = frozenset({
     "/api/v1/admin/sso/login",  # Admin SSO Giriş — Tarayıcı tabanlı, bypass
 })
 
+# Prefix bazlı bypass: bu path'lerle başlayan tüm admin rotalar JWT ile korunur, ClientAuth gerekmez
+_BYPASS_PREFIXES = (
+    "/api/v1/admin/corporate",  # Admin kurumsal başvuru yönetimi (JWT korumalı)
+)
+
 _FLUTTER_UA_KEYWORDS = ("Dart/", "dart:", "Flutter/")
 
 
@@ -69,6 +74,10 @@ class ClientAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if request.url.path in _BYPASS_PATHS:
+            return await call_next(request)
+
+        # Prefix tabanlı bypass (örn: tüm /api/v1/admin/corporate/* rotaları)
+        if any(request.url.path.startswith(prefix) for prefix in _BYPASS_PREFIXES):
             return await call_next(request)
 
         if not self.settings.flutter_client_auth_enabled:

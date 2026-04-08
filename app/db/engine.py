@@ -69,6 +69,7 @@ async def create_all_tables() -> None:
     import app.models.user          # noqa: F401
     import app.models.user_session  # noqa: F401
     import app.models.audit_event   # noqa: F401
+    import app.models.corporate_application  # noqa: F401
 
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
