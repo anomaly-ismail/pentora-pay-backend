@@ -54,9 +54,13 @@ _BYPASS_PATHS = frozenset({
     "/api/v1/admin/sso/login",  # Admin SSO Giriş — Tarayıcı tabanlı, bypass
 })
 
-# Prefix bazlı bypass: bu path'lerle başlayan tüm admin rotalar JWT ile korunur, ClientAuth gerekmez
+# Prefix bazlı bypass: bu path'lerle başlayan rotalar ClientAuth'dan muaf
+# Admin rotaları → JWT ile korunur (require_admin_jwt dependency)
+# Corporate apply → Flutter handshake header'larını kendi taşıyor; bu middleware
+#   sadece UA+signature kontrolü yapar, o kontrol aşağıda zaten devam eder.
+#   Ancak /api/v1/admin/* tarayıcıdan geldiği için Flutter UA check'i bypass gerekiyor.
 _BYPASS_PREFIXES = (
-    "/api/v1/admin/corporate",  # Admin kurumsal başvuru yönetimi (JWT korumalı)
+    "/api/v1/admin/",      # Tüm admin rotaları — tarayıcı/JWT ile erişilir
 )
 
 _FLUTTER_UA_KEYWORDS = ("Dart/", "dart:", "Flutter/")

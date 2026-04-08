@@ -58,8 +58,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         t0 = time.perf_counter()
 
-        # İstek gövdesini oku (imza ve SQL taraması için)
-        body = await request.body()
+        # multipart/form-data body'sini ASLA okuma — multipart parser'ı bozar
+        content_type = request.headers.get("content-type", "")
+        is_multipart = "multipart/form-data" in content_type or "application/octet-stream" in content_type
+
+        if is_multipart:
+            body = b""  # Binary body taranmaz, boş geç
+        else:
+            # İstek gövdesini oku (imza ve SQL taraması için)
+            body = await request.body()
 
         # ── [D] SQL Taraması ────────────────────────────────────────────────
         sql_scan_result = _perform_sql_scan(request, body)
@@ -242,24 +249,38 @@ def _apply_pentora_signature(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _perform_sql_scan(request: Request, body: bytes) -> object:
-    """İstek URL, query string ve gövdesini SQL enjeksiyon örüntüleri için tarar."""
+    """İstek URL ve query string'ini SQL enjeksiyon örüntüleri için tarar.
+    NOT: Binary/multipart body asla taranmaz — yanlış pozitif üretir ve performansı düşürür.
+    """
     settings = get_settings()
-    if not settings.pentora_sql_guard_enabled or request.url.path == "/api/v1/admin/sso/login":
+
+    # SQL guard kapalıysa veya muaf path'teyse atla
+    if not settings.pentora_sql_guard_enabled:
         from app.core.security import SQLScanResult
         return SQLScanResult(False, 0)
 
-    # Taranacak içerik: URL path + query string + body (text ise)
-    scan_target_parts = [
-        str(request.url.path),
-        str(request.url.query),
-    ]
-    try:
-        scan_target_parts.append(body.decode("utf-8", errors="replace"))
-    except Exception:
-        pass
+    path = str(request.url.path)
+
+    # Sadece path+query tara; body sadece JSON/text için taranır
+    scan_target_parts = [path, str(request.url.query)]
+
+    # Binary olmayan body'leri de tara
+    if body:
+        content_type = request.headers.get("content-type", "")
+        is_binary = (
+            "multipart" in content_type
+            or "octet-stream" in content_type
+            or "image/" in content_type
+            or "application/pdf" in content_type
+        )
+        if not is_binary:
+            try:
+                scan_target_parts.append(body.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
 
     combined = " ".join(scan_target_parts)
-    return scan_for_sql_injection(combined, path=str(request.url.path))
+    return scan_for_sql_injection(combined, path=path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
