@@ -89,3 +89,11 @@ def verify_signature(*args, **kwargs) -> bool:
 # Request ID üretici:
 def generate_request_id() -> str:
     return str(uuid.uuid4())
+
+def safe_compare(a: str, b: str) -> bool:
+    """Zamanlama saldırılarına karşı sabit-zamanlı karşılaştırma."""
+    import hmac
+    return hmac.compare_digest(
+        a.encode("utf-8"),
+        b.encode("utf-8"),
+    )
