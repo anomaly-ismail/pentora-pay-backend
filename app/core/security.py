@@ -66,9 +66,20 @@ def verify_signature(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Yaygın SQL enjeksiyon örüntüleri (heuristic, parameterized queries asıl koruma)
-def scan_for_sql_injection(content: str, path: str = "") -> SQLScanResult:
-    # TEST MODU: 17. saat hatırası
-    return SQLScanResult(detected=False, pattern_count=0)
+_SQL_PATTERNS = re.compile(
+    r"""
+    (\b(SELECT|INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|EXEC|UNION|HAVING)\b)
+    | (--|;--|\/\*|\*\/)                    # SQL yorum kalıpları
+    | (\bOR\b\s+\d+\s*=\s*\d+)             # OR 1=1 tipi
+     | (\bAND\b\s+\d+\s*=\s*\d+)            # AND 1=1 tipi
+#   | (\'.*?\'|\".*?\")                     # Tek/çift tırnak kombinasyonları
+    | (CAST\s*\(|CONVERT\s*\()             # Tip dönüşüm fonksiyonları
+    | (INFORMATION_SCHEMA|SYS\.|SYSOBJECTS) # Sistem tabloları
+    | (WAITFOR\s+DELAY|SLEEP\s*\()         # Time-based blind injection
+    | (XP_CMDSHELL|SP_EXECUTESQL)          # MSSQL tehlikeli prosedürler
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 class SQLScanResult:
@@ -96,29 +107,38 @@ def _risk_level(count: int) -> str:
     return "HIGH"
 
 
-# Tarama dışı tutulan path'ler — bu yollardaki içerik SQL kontrolünden geçmez
+# Tarama dışı tutulan path'ler (Küçük harf ve normalize edilmiş olmalı)
 _SQL_BYPASS_PATHS: frozenset[str] = frozenset({
-    "/api/v1/admin/sso/login",     # JSON tırnaklarını yanlış pozitif tetikler
-    "/api/v1/corporate/apply",     # multipart/form-data — binary PDF/PNG içerir, taranamaz
+    "/api/v1/admin/sso/login",
+    "/api/v1/corporate/apply",
 })
 
-# Prefix tabanlı bypass'lar (örn: büyük dosya upload endpoint'leri)
 _SQL_BYPASS_PREFIXES: tuple[str, ...] = (
-    "/api/v1/corporate/apply",     # yedek olarak prefix bazlı eklendi
+    "/api/v1/corporate/apply",
 )
 
 
 def is_sql_injection_bypassed(path: str) -> bool:
-    """Verilen path'in SQL taramasından muaf olup olmadığını kontrol eder."""
+    """
+    Verilen path'in SQL taramasından muaf olup olmadığını kontrol eder.
+    Normalize eder (küçük harf, boşlukları temizler).
+    """
     if not path:
         return False
     
+    # Normalizasyon: lowercase, strip, trailing slash temizliği (eğer / değilse)
+    p = path.strip().lower()
+    if p != "/" and p.endswith("/"):
+        p = p.rstrip("/")
+    
     # Tam eşleşme kontrolü
-    if path in _SQL_BYPASS_PATHS:
+    if p in _SQL_BYPASS_PATHS:
+        logger.info(f"[SQL-GUARD] Bypass matched (exact): {path}")
         return True
         
     # Prefix kontrolü
-    if any(path.startswith(p) for p in _SQL_BYPASS_PREFIXES):
+    if any(p.startswith(pref) for pref in _SQL_BYPASS_PREFIXES):
+        logger.info(f"[SQL-GUARD] Bypass matched (prefix): {path}")
         return True
         
     return False
