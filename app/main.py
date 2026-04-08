@@ -119,12 +119,17 @@ app.add_middleware(
     max_age=600,
 )
 
-# 1. Trusted Host (Host header injection koruması — OWASP A05)
-if settings.is_production:
-    app.add_middleware(
-        TrustedHostMiddleware,
-        allowed_hosts=["guvenliodeme.example.com", "api.guvenliodeme.example.com"],
-    )
+# 1. Trusted Host — her ortamda aktif (OWASP A05: Security Misconfiguration)
+# Güvenlik hiçbir zaman APP_ENV flag'ine bağımlı olmamalı
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=[
+        "localhost",
+        "127.0.0.1",
+        "api.pentorasec.com.tr",
+        "pay.pentorasec.com.tr",
+    ],
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Route'lar
