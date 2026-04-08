@@ -56,8 +56,13 @@ class Settings(BaseSettings):
 
     # ── JWT ─────────────────────────────────────────────────────────────────────
     jwt_algorithm: str = "HS256"
+    jwt_secret: str
     jwt_access_token_expire_minutes: int = 30
     jwt_refresh_token_expire_days: int = 7
+
+    # ── Admin SSO ───────────────────────────────────────────────────────────────
+    admin_mail: str
+    admin_pass: str
 
     # ── PostgreSQL ───────────────────────────────────────────────────────────────
     postgres_host: str = "localhost"
