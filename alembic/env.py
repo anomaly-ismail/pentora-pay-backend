@@ -70,32 +70,45 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-async def run_async_migrations(override_url: str | None = None) -> None:
+async def run_async_migrations() -> None:
     """In this scenario we need to create an Engine
     and associate a connection with the context.
     Bu fonksiyon engine.py'den de doğrudan çağrılabilir.
 
     override_url: engine.py'den çağrılırken settings'ten URL geçilebilir.
     """
-    if override_url:
-        config.set_main_option("sqlalchemy.url", override_url)
+    connectable = config.attributes.get("connection", None)
 
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
+    if connectable is None:
+        # CLI'dan çağrıldı — kendi engine'ini oluştur
+        engine = async_engine_from_config(
+            config.get_section(config.config_ini_section, {}),
+            prefix="sqlalchemy.",
+            poolclass=pool.NullPool,
+        )
+        async with engine.connect() as connection:
+            await connection.run_sync(do_run_migrations)
+        await engine.dispose()
+    else:
+        # Programmatic: dışarıdan bağlantı verildi (engine.py startup)
+        await connectable.run_sync(do_run_migrations)
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode."""
+    """Run migrations in 'online' mode.
 
-    asyncio.run(run_async_migrations())
+    CLI'dan çağrıldığında asyncio.run kullanır.
+    Programmatic kullanımda (engine.py startup) cfg.attributes["connection"]
+    set edilmiş olur; bu durumda do_run_migrations doğrudan çağrılır.
+    """
+    connectable = config.attributes.get("connection", None)
+
+    if connectable is not None:
+        # Programmatic: zaten sync bağlantı içindeyiz (conn.run_sync tarafından çağrıldık)
+        do_run_migrations(connectable)
+    else:
+        # CLI: kendi async engine'ini oluştur
+        asyncio.run(run_async_migrations())
 
 
 if context.is_offline_mode():

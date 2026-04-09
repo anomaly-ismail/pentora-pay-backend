@@ -73,50 +73,26 @@ async def run_migrations() -> None:
     alembic upgrade head ile eşdeğer — manuel komut gerekmez.
     Idempotent: zaten güncel ise hiçbir şey yapmaz.
 
-    env.py'deki run_async_migrations mantığını doğrudan uygular;
+    Resmi Alembic "Programmatic API with Asyncio" pattern'i kullanır:
+    cfg.attributes["connection"] ile bağlantı env.py'ye geçirilir,
     asyncio.run() çakışması yoktur.
     """
     from pathlib import Path
     from alembic.config import Config
-    from alembic.runtime.migration import MigrationContext
-    from alembic.script import ScriptDirectory
-    from sqlalchemy import pool
-    from sqlalchemy.ext.asyncio import async_engine_from_config
+    from alembic import command
 
     project_root = Path(__file__).parent.parent.parent
     cfg = Config(str(project_root / "alembic.ini"))
     cfg.set_main_option("sqlalchemy.url", get_settings().database_url)
 
-    # Tüm modelleri yükle — target_metadata için
-    from app.db.base import Base
-    import app.models.user                       # noqa: F401
-    import app.models.user_session               # noqa: F401
-    import app.models.audit_event                # noqa: F401
-    import app.models.accounting                 # noqa: F401
-    import app.models.notification               # noqa: F401
-    import app.models.user_device                # noqa: F401
-    import app.models.corporate_application      # noqa: F401
-    import app.models.web_corporate_application  # noqa: F401
-    target_metadata = Base.metadata
+    def _run_upgrade(connection, cfg):
+        cfg.attributes["connection"] = connection
+        command.upgrade(cfg, "head")
 
-    from alembic import context as alembic_ctx
-
-    def _do_upgrade(connection):
-        alembic_ctx.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-        )
-        with alembic_ctx.begin_transaction():
-            alembic_ctx.run_migrations()
-
-    connectable = async_engine_from_config(
-        cfg.get_section(cfg.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-    async with connectable.connect() as conn:
-        await conn.run_sync(_do_upgrade)
-    await connectable.dispose()
+    engine = create_async_engine(get_settings().database_url)
+    async with engine.begin() as conn:
+        await conn.run_sync(_run_upgrade, cfg)
+    await engine.dispose()
 
     logger.info("db.migrations.applied")
 
