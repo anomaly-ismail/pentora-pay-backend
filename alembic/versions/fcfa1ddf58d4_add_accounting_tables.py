@@ -60,6 +60,7 @@ def upgrade() -> None:
     # ### end Alembic commands ###
 
     # ── Custom Data Migration for Existing Users ──────────────────────────────
+    # INSERT ... ON CONFLICT DO NOTHING: idempotent, lock-safe, tekrar çalışırsa hata vermez
     op.execute("""
         INSERT INTO accounts (id, user_id, name, type, currency, balance, is_active, created_at, updated_at)
         SELECT 
@@ -76,6 +77,7 @@ def upgrade() -> None:
         WHERE NOT EXISTS (
             SELECT 1 FROM accounts a WHERE a.user_id = u.id AND a.currency = 'TRY'
         )
+        ON CONFLICT DO NOTHING
     """)
 
 def downgrade() -> None:
