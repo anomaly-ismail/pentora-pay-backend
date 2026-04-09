@@ -100,6 +100,7 @@ def run_migrations_online() -> None:
     CLI'dan çağrıldığında asyncio.run kullanır.
     Programmatic kullanımda (engine.py startup) cfg.attributes["connection"]
     set edilmiş olur; bu durumda do_run_migrations doğrudan çağrılır.
+    stamp/current/history gibi komutlar için migration çalıştırılmaz.
     """
     connectable = config.attributes.get("connection", None)
 
