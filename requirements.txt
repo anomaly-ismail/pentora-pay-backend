@@ -15,6 +15,9 @@ rich==13.9.4
 email-validator>=2.0.0
 firebase-admin==6.5.0
 
+# Performance (production)
+uvloop==0.21.0
+httptools==0.6.4
 
 # Database
 sqlalchemy[asyncio]==2.0.36

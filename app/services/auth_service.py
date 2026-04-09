@@ -4,6 +4,7 @@ Repository katmanını kullanır, HTTP'den izoledir.
 """
 from __future__ import annotations
 
+import asyncio
 import secrets
 from datetime import datetime, timezone
 
@@ -176,12 +177,13 @@ async def login_user(
     # Güvenlik önlemi: Kullanıcı yoksa da aynı hesaplama yükünü ver (Constant-time trick)
     hash_to_verify = user.pin_hash if user_found else dummy_hash
     
-    from argon2.exceptions import VerifyMismatchError
+    from argon2.exceptions import VerifyMismatchError, VerificationError
     try:
         from app.repositories.user_repo import _pin_hasher
-        _pin_hasher.verify(hash_to_verify, request.pin)
+        # Argon2id CPU-yoğun işlem — event loop'u bloklamaz
+        await asyncio.to_thread(_pin_hasher.verify, hash_to_verify, request.pin)
         pin_valid = True
-    except (VerifyMismatchError, Exception):
+    except (VerifyMismatchError, VerificationError, Exception):
         pin_valid = False
 
     if not user_found or not pin_valid or not is_active:

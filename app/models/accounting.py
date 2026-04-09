@@ -176,3 +176,10 @@ class JournalEntry(Base):
     # Relationships
     transaction: Mapped["Transaction"] = relationship("Transaction", back_populates="entries")
     account: Mapped["Account"] = relationship("Account", back_populates="entries")
+
+    __table_args__ = (
+        # account_id + created_at: işlem geçmişi sorgularında sıralama için kritik
+        Index("ix_journal_entries_account_created", "account_id", "created_at"),
+        # transaction_id: journal entry → transaction join için
+        Index("ix_journal_entries_tx_account", "transaction_id", "account_id"),
+    )

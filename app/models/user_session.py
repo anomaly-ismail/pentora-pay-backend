@@ -116,6 +116,8 @@ class UserSession(Base):
             "user_id", "expires_at",
             postgresql_where=text("is_revoked = false"),
         ),
+        # Token hash lookup — her auth isteğinde kullanılır, index zorunlu
+        Index("ix_sessions_token_hash", "grauth_token_hash", unique=True),
     )
 
     def __repr__(self) -> str:

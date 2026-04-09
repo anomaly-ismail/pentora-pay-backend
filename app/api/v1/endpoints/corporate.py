@@ -20,8 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.dependencies import get_db
-from app.api.dependencies import get_current_user_optional
-from app.models.user import User
+from app.api.dependencies import get_current_user_optional, UserDTO
 from app.schemas.corporate_application import (
     CorporateApplicationCreate,
     CorporateApplicationListResponse,
@@ -93,7 +92,7 @@ async def submit_corporate_application(
     imza_sirkuleri: UploadFile = File(..., description="İmza sirküleri (PDF/JPG/PNG, maks 5MB)"),
     ticaret_sicil:  UploadFile = File(..., description="Ticaret sicil gazetesi (PDF/JPG/PNG, maks 5MB)"),
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: Optional[UserDTO] = Depends(get_current_user_optional),
 ) -> dict:
     form_data = CorporateApplicationCreate(
         company_name=company_name,

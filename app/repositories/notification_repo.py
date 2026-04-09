@@ -53,22 +53,25 @@ class NotificationRepo:
         limit:  int = 50,
         offset: int = 0,
     ) -> tuple[int, int, list[Notification]]:
-        """(total, unread_count, notifications)"""
-        base = select(Notification).where(Notification.user_id == user_id)
-
-        total      = (await self._session.execute(
-            select(func.count()).select_from(Notification).where(Notification.user_id == user_id)
-        )).scalar_one()
-
-        unread_count = (await self._session.execute(
-            select(func.count()).select_from(Notification).where(
-                Notification.user_id == user_id,
-                Notification.is_read == False,   # noqa: E712
-            )
-        )).scalar_one()
+        """(total, unread_count, notifications)
+        
+        total ve unread_count tek sorguda FILTER ile hesaplanır.
+        """
+        # Tek sorguda total + unread_count — iki ayrı COUNT yerine
+        stmt_counts = select(
+            func.count().label("total"),
+            func.count().filter(Notification.is_read.is_(False)).label("unread"),
+        ).where(Notification.user_id == user_id)
+        counts = (await self._session.execute(stmt_counts)).one()
+        total = counts.total
+        unread_count = counts.unread
 
         rows = (await self._session.execute(
-            base.order_by(Notification.created_at.desc()).limit(limit).offset(offset)
+            select(Notification)
+            .where(Notification.user_id == user_id)
+            .order_by(Notification.created_at.desc())
+            .limit(limit)
+            .offset(offset)
         )).scalars().all()
 
         return total, unread_count, list(rows)

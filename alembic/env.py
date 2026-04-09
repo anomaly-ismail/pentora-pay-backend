@@ -70,11 +70,15 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-async def run_async_migrations() -> None:
+async def run_async_migrations(override_url: str | None = None) -> None:
     """In this scenario we need to create an Engine
     and associate a connection with the context.
+    Bu fonksiyon engine.py'den de doğrudan çağrılabilir.
 
+    override_url: engine.py'den çağrılırken settings'ten URL geçilebilir.
     """
+    if override_url:
+        config.set_main_option("sqlalchemy.url", override_url)
 
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),

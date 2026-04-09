@@ -4,9 +4,8 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import get_current_user
+from app.api.dependencies import get_current_user, UserDTO
 from app.db.dependencies import get_db
-from app.models.user import User
 from app.repositories.notification_repo import NotificationRepo
 from app.repositories.user_device_repo import UserDeviceRepo
 from app.schemas.notification import (
@@ -23,7 +22,7 @@ async def list_notifications(
     limit: int = 50,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: UserDTO = Depends(get_current_user),
 ) -> NotificationListResponse:
     repo = NotificationRepo(db)
     total, unread_count, rows = await repo.get_for_user(
@@ -42,7 +41,7 @@ async def list_notifications(
 async def mark_notification_read(
     notification_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: UserDTO = Depends(get_current_user),
 ) -> NotificationResponse:
     repo = NotificationRepo(db)
     notif = await repo.mark_read(notification_id, user.id)
@@ -55,7 +54,7 @@ async def mark_notification_read(
 @router.patch("/read-all", summary="Tum bildirimleri okundu yap")
 async def mark_all_notifications_read(
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: UserDTO = Depends(get_current_user),
 ) -> dict:
     repo = NotificationRepo(db)
     count = await repo.mark_all_read(user.id)
@@ -67,7 +66,7 @@ async def mark_all_notifications_read(
 async def register_device_token(
     body: DeviceTokenRegisterRequest,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: UserDTO = Depends(get_current_user),
 ) -> dict:
     token = body.token.strip()
     if len(token) < 20:
