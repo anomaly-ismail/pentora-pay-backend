@@ -67,8 +67,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         from app.core.security import is_sql_injection_bypassed
         is_bypassed = is_sql_injection_bypassed(path)
 
-        if is_multipart or is_bypassed:
-            body = b""  # Binary veya muaf path'ler taranmaz, boş geç
+        # Ödeme portalı HTML sayfaları — form-urlencoded body okuma, Starlette parser'ı işlesin
+        is_pay_portal = path.startswith("/pay/")
+
+        if is_multipart or is_bypassed or is_pay_portal:
+            body = b""  # Binary, muaf ya da portal path'ler taranmaz
         else:
             # İstek gövdesini oku (imza ve SQL taraması için)
             body = await request.body()
@@ -86,7 +89,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
         # ── [A] Standart Tarayıcı Güvenlik Header'ları ─────────────────────
-        _apply_standard_headers(response, self.settings)
+        _apply_standard_headers(response, self.settings, path=path)
 
         # ── [B] Bilgi Sızıntısı Önleme ─────────────────────────────────────
         _remove_disclosure_headers(response)
@@ -112,7 +115,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 # [A] Standart Header Uygulayıcıları
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _apply_standard_headers(response: Response, settings) -> None:
+def _apply_standard_headers(response: Response, settings, path: str = "") -> None:
     """
     OWASP Secure Headers Project ve Mozilla Observatory'ye göre
     tüm standart güvenlik header'larını ekler.
@@ -138,14 +141,30 @@ def _apply_standard_headers(response: Response, settings) -> None:
     h["X-Frame-Options"] = "DENY"
 
     # ── Content Security Policy (OWASP A05, ISO 27001 A.14) ─────────────────
-    # API için katı CSP — sadece kendi origin'den yükleme
-    h["Content-Security-Policy"] = (
-        "default-src 'none'; "
-        "frame-ancestors 'none'; "
-        "base-uri 'none'; "
-        "form-action 'none'; "
-        "upgrade-insecure-requests"
-    )
+    if path.startswith("/pay/"):
+        # Ödeme portalı HTML sayfaları için gevşetilmiş CSP:
+        #   - style-src 'unsafe-inline': <style> blokları ve style="..." izinli
+        #   - form-action 'self': form submit'i sadece kendi sunucuya izinli
+        #   - script-src 'none': JavaScript tamamen yasak (portal JS kullanmıyor)
+        #   - img-src data:: emoji/ikonlar için data URI izinli
+        h["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            "style-src 'unsafe-inline'; "
+            "img-src data:; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'none'; "
+            "upgrade-insecure-requests"
+        )
+    else:
+        # API için katı CSP — sadece kendi origin'den yükleme
+        h["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'none'; "
+            "form-action 'none'; "
+            "upgrade-insecure-requests"
+        )
 
     # ── XSS Koruması (eski tarayıcılar için) ────────────────────────────────
     # Modern tarayıcılarda CSP yeterli; 0 = tarayıcı XSS filtrini devre dışı
