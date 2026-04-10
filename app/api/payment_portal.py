@@ -13,6 +13,7 @@ GET  /pay/{receive_id}/fail     → Başarısız ödeme sayfası
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Request
@@ -174,6 +175,23 @@ async def payment_page(
           </div>
         """, "Ödeme Onay Bekleniyor")
 
+    # PENDING_PAYMENT — expiry kontrolü
+    if req.expires_at and datetime.now(timezone.utc) > req.expires_at:
+        # Veritabanında durumu da güncelle
+        req.status = CorporateReceiveStatus.EXPIRED
+        await db.commit()
+        return _html("""
+          <div class="card">
+            <div class="logo"><div class="logo-mark">P</div>
+              <div><div class="logo-text">Pentora Pay</div><div class="logo-sub">Güvenli Ödeme</div></div>
+            </div>
+            <span class="icon">⏰</span>
+            <p class="result-title" style="color:#ffab40">Süre Doldu</p>
+            <p class="result-sub">Bu ödeme bağlantısının 5 dakikalık geçerlilik süresi dolmuştur.<br>
+              Lütfen kuyumcu ile tekrar iletişime geçin.</p>
+          </div>
+        """, "Süre Doldu")
+
     # PENDING_PAYMENT — ödeme sayfasını göster
     is_mock = not (settings.paytr_merchant_id and settings.paytr_merchant_key)
     mock_badge = (
@@ -327,10 +345,46 @@ async def success_page(
     receive_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ) -> HTMLResponse:
+    settings_obj = get_settings()
+    is_mock = not (settings_obj.paytr_merchant_id and settings_obj.paytr_merchant_key)
+
     repo = CorporateReceiveRepo(db)
     req  = await repo.get_by_id(receive_id)
     amount_str = _fmt_amount(req.amount) if req else "—"
     phone_masked = ("***" + req.recipient_phone[-4:]) if req and req.recipient_phone else "—"
+
+    # Zaten tamamlandıysa ayrı mesaj göster
+    if req and req.status == CorporateReceiveStatus.COMPLETED:
+        return _html(f"""
+          <div class="card">
+            <div class="logo"><div class="logo-mark">P</div>
+              <div><div class="logo-text">Pentora Pay</div><div class="logo-sub">Güvenli Ödeme</div></div>
+            </div>
+            <span class="icon">🎉</span>
+            <p class="result-title" style="color:#69f0ae">İşlem Tamamlandı!</p>
+            <p class="result-sub">
+              <strong style="color:#f0d080">{amount_str} TL</strong> kuyumcunun hesabına aktarıldı.<br>
+              Teşekkür ederiz.
+            </p>
+          </div>
+        """, "İşlem Tamamlandı")
+
+    mock_block = ""
+    if is_mock:
+        mock_block = f"""
+        <form method="POST" action="/pay/{receive_id}/mock-approve" style="margin-top:22px">
+          <p style="color:#ffab40;font-size:12px;margin-bottom:10px;text-align:center">
+            ⚠ TEST MODU — Ürünü teslim aldınız mı?
+          </p>
+          <button type="submit" class="btn btn-pay" style="
+            background:linear-gradient(135deg,#2e7d32,#1b5e20);
+            border:1px solid #4caf50;
+            font-size:16px;font-weight:700;letter-spacing:.5px;
+            display:block;width:100%;text-align:center;
+          ">
+            ✅ Mock — ONAYLIYORUM Gönder
+          </button>
+        </form>"""
 
     return _html(f"""
       <div class="card">
@@ -357,11 +411,76 @@ async def success_page(
           yazarak gönderin. İşleminiz tamamlanacaktır.
         </div>
 
+        {mock_block}
+
         <div class="secure-bar">
           🔒 Paranız güvende — kuyumcu teslim sonrası serbest bırakır
         </div>
       </div>
     """, "Ödeme Başarılı")
+
+
+# ─── POST /pay/{receive_id}/mock-approve ─────────────────────────────────────
+# Sadece test modunda çalışır (PayTR credentials yoksa). ONAYLIYORUM webhook'unu simüle eder.
+
+@router.post("/{receive_id}/mock-approve", include_in_schema=False)
+async def mock_approve(
+    receive_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> RedirectResponse:
+    settings_obj = get_settings()
+    is_mock = not (settings_obj.paytr_merchant_id and settings_obj.paytr_merchant_key)
+    if not is_mock:
+        # Gerçek prod ortamında bu endpoint devre dışı
+        return RedirectResponse(f"/pay/{receive_id}/success", status_code=303)
+
+    repo     = CorporateReceiveRepo(db)
+    acc_repo = AccountingRepository(db)
+
+    req = await repo.get_by_id_for_update(receive_id)
+    if not req:
+        return RedirectResponse(f"/pay/{receive_id}/fail", status_code=303)
+    if req.status == CorporateReceiveStatus.COMPLETED:
+        return RedirectResponse(f"/pay/{receive_id}/success", status_code=303)
+    if req.status != CorporateReceiveStatus.PENDING_APPROVAL:
+        logger.warning("payment_portal.mock_approve.wrong_status",
+                       receive_id=str(receive_id), status=req.status.value)
+        return RedirectResponse(f"/pay/{receive_id}/success", status_code=303)
+
+    # Escrow → Ana Cüzdan (webhooks.py'deki ONAYLIYORUM mantığını aynen uygula)
+    escrow = await acc_repo.get_user_escrow_for_update(req.seller_user_id)
+    wallet = await acc_repo.get_user_primary_wallet_for_update(req.seller_user_id)
+
+    if not escrow or not wallet:
+        logger.error("payment_portal.mock_approve.accounts_missing",
+                     receive_id=str(receive_id))
+        return RedirectResponse(f"/pay/{receive_id}/fail", status_code=303)
+
+    amount            = normalize(req.amount)
+    idempotency_key   = f"mock_approve_{receive_id}"
+
+    try:
+        await acc_repo.record_transaction(
+            reference_id=idempotency_key,
+            description=f"[MOCK] Müşteri Onayı | {req.gold_type} | TCKN: {req.recipient_tckn}",
+            entries=[
+                # Escrow azaldı (LIABILITY DEBIT)
+                {"account_id": escrow.id, "direction": JournalDirection.DEBIT,  "amount": amount},
+                # Ana cüzdan arttı (LIABILITY CREDIT)
+                {"account_id": wallet.id, "direction": JournalDirection.CREDIT, "amount": amount},
+            ],
+        )
+    except ValueError as exc:
+        logger.error("payment_portal.mock_approve.accounting_error", error=str(exc))
+        return RedirectResponse(f"/pay/{receive_id}/fail", status_code=303)
+
+    await repo.mark_completed(req)
+    await db.commit()
+
+    logger.info("payment_portal.mock_approve.completed",
+                receive_id=str(receive_id), amount=str(amount))
+
+    return RedirectResponse(f"/pay/{receive_id}/success", status_code=303)
 
 
 # ─── GET /pay/{receive_id}/fail ───────────────────────────────────────────────

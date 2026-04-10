@@ -14,7 +14,7 @@ from app.models.corporate_receive_request import (
     CorporateReceiveStatus,
 )
 
-_REQUEST_TTL_HOURS = 24
+_REQUEST_TTL_MINUTES = 5    # Ödeme linki 5 dakika geçerli
 
 
 class CorporateReceiveRepo:
@@ -33,7 +33,7 @@ class CorporateReceiveRepo:
         mrz_verified: bool = False,
         nfc_verified: bool = False,
     ) -> CorporateReceiveRequest:
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=_REQUEST_TTL_HOURS)
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=_REQUEST_TTL_MINUTES)
         req = CorporateReceiveRequest(
             seller_user_id=seller_user_id,
             recipient_tckn=recipient_tckn,

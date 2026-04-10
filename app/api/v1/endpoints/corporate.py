@@ -483,6 +483,24 @@ async def create_corporate_receive(
     }
 
 
+# ─── GET /corporate/receive/{receive_id}/status ───────────────────────────────
+# Flutter bu endpoint'i periyodik olarak poll eder (5 sn'de bir)
+
+@corp_router.get("/receive/{receive_id}/status")
+async def get_receive_status(
+    receive_id: uuid.UUID,
+    current_user: UserDTO = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    receive_repo = CorporateReceiveRepo(db)
+    req = await receive_repo.get_by_id(receive_id)
+    if not req:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ödeme talebi bulunamadı")
+    if req.seller_user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Yetkisiz erişim")
+    return {"status": req.status.value}
+
+
 # ─── Admin: Başvuruyu Getir ───────────────────────────────────────────────────
 @admin_corp_router.get(
     "/applications/{app_id}",
