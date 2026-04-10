@@ -42,6 +42,8 @@ from app.services import corporate_application_service as svc
 from app.services import web_corporate_application_service as web_svc
 from app.repositories.corporate_application_repo import CorporateApplicationRepo
 from app.repositories.corporate_payment_repo import CorporatePaymentRepo
+from app.repositories.accounting_repo import AccountingRepository, normalize
+from app.models.accounting import AccountType, JournalDirection
 from app.services.netgsm_service import send_otp_sms
 
 logger = get_logger(__name__)
@@ -276,10 +278,75 @@ async def verify_corporate_payment_otp(
         await db.commit()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
 
-    # TODO: Bakiyeden düşme işlemi accounting servisine bağlanacak
+    # ── Çift Taraflı Kayıt (Double-Entry) ile bakiye düşme ──────────────────
+    acc_repo = AccountingRepository(db)
+
+    # Kullanıcı cüzdanını row-level lock ile çek (eş zamanlı işlem koruması)
+    wallet = await acc_repo.get_user_primary_wallet_for_update(current_user.id)
+    if not wallet:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Kullanıcı cüzdanı bulunamadı.",
+        )
+
+    amount = normalize(Decimal(str(payment.amount)))
+
+    # Son anlık bakiye kontrolü (arayüzden gelen değer stale olabilir)
+    if Decimal(str(wallet.balance)) < amount:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Yetersiz bakiye.",
+        )
+
+    # Sistem tarafındaki karşı hesap (REVENUE) — kurumsal işlem geliri
+    # REVENUE: CREDIT (+) ile artar; Journal dengesi sağlanır: DEBIT LIABILITY = CREDIT REVENUE
+    system_account = await acc_repo.get_or_create_system_account(
+        name="Kurumsal Ödeme Havuzu",
+        account_type=AccountType.REVENUE,
+        currency="TRY",
+    )
+
+    # İdempotency key olarak payment.id — aynı ödeme iki kez işlenemez
+    idempotency_key = f"corp_pay_{payment.id}"
+
+    try:
+        await acc_repo.record_transaction(
+            reference_id=idempotency_key,
+            description=(
+                f"Kurumsal Ödeme | {payment.gold_type} | "
+                f"Alıcı TCKN: {payment.recipient_tckn}"
+            ),
+            entries=[
+                # LIABILITY DEBIT  → kullanıcı bakiyesi azalır
+                {
+                    "account_id": wallet.id,
+                    "direction": JournalDirection.DEBIT,
+                    "amount": amount,
+                },
+                # ASSET CREDIT → sistem ödeme havuzundan çıktı (para altın satıcısına gitti)
+                {
+                    "account_id": system_account.id,
+                    "direction": JournalDirection.CREDIT,
+                    "amount": amount,
+                },
+            ],
+        )
+    except ValueError as exc:
+        # Unbalanced journal, negatif bakiye vb. — mükerrer ödemeye izin verme
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    # ────────────────────────────────────────────────────────────────────────
+
     await db.commit()
 
-    logger.info("corporate.payment.completed", payment_id=str(payment_id))
+    logger.info(
+        "corporate.payment.completed",
+        payment_id=str(payment_id),
+        amount=str(amount),
+        wallet_id=str(wallet.id),
+    )
     return {
         "success": True,
         "payment_id": str(payment_id),

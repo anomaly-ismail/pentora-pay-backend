@@ -1,5 +1,5 @@
 import uuid
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_EVEN
 from datetime import datetime, timezone
 from typing import TypedDict, List
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +13,14 @@ from app.models.accounting import (
     JournalEntry,
     JournalDirection,
 )
+
+# Para birimleri için standart hassasiyet: 4 ondalık basamak (Banker's rounding)
+CURRENCY_QUANTUM = Decimal("0.0001")
+
+
+def normalize(amount: Decimal) -> Decimal:
+    """Tutarı 4 ondalık basamağa yuvarlar (ROUND_HALF_EVEN = Banker's rounding)."""
+    return amount.quantize(CURRENCY_QUANTUM, rounding=ROUND_HALF_EVEN)
 
 class EntryRequest(TypedDict):
     account_id: uuid.UUID
@@ -54,6 +62,48 @@ class AccountingRepository:
         result = await self.db.execute(stmt)
         return result.scalars().first()
 
+    async def get_user_primary_wallet_for_update(self, user_id: uuid.UUID) -> Account | None:
+        """Aynı hesabı SELECT FOR UPDATE (row-level lock) ile çeker — race condition önlemi."""
+        stmt = (
+            select(Account)
+            .where(
+                Account.user_id == user_id,
+                Account.type == AccountType.LIABILITY,
+                Account.currency == "TRY",
+                Account.name == "Ana Cüzdan",
+            )
+            .with_for_update()
+        )
+        result = await self.db.execute(stmt)
+        return result.scalars().first()
+
+    async def get_or_create_system_account(
+        self,
+        name: str,
+        account_type: AccountType = AccountType.ASSET,
+        currency: str = "TRY",
+    ) -> Account:
+        """
+        Verilen adla sistem hesabını getirir; yoksa oluşturur.
+        Sistem hesapları user_id=None ve ASSET tipindedir.
+        """
+        stmt = select(Account).where(
+            Account.user_id.is_(None),
+            Account.name == name,
+            Account.currency == currency,
+        )
+        result = await self.db.execute(stmt)
+        account = result.scalars().first()
+        if account:
+            return account
+        return await self.create_account(
+            name=name,
+            type=account_type,
+            user_id=None,
+            currency=currency,
+            initial_balance=Decimal("0.0000"),
+        )
+
     async def record_transaction(
         self,
         reference_id: str | None,
@@ -84,7 +134,7 @@ class AccountingRepository:
 
         # 3. Yevmiye kayıtları ve Account Bakiye güncellemeleri
         for req in entries:
-            amount = req["amount"]
+            amount = normalize(req["amount"])   # Banker's rounding — küsürat kayması yok
             if amount <= 0:
                 raise ValueError("Journal entry amount must be strictly positive.")
 
