@@ -128,6 +128,8 @@ app.add_middleware(
         "127.0.0.1",
         "api.pentorasec.com.tr",
         "pay.pentorasec.com.tr",
+        "pentorasec.online",
+        "www.pentorasec.online",
     ],
 )
 
