@@ -6,6 +6,7 @@ POST  /api/v1/corporate/apply                        → Flutter (ClientAuth)
 GET   /api/v1/corporate/status                       → Flutter (GRAuth)
 POST  /api/v1/corporate/payment                      → Flutter (GRAuth)
 POST  /api/v1/corporate/payment/{id}/verify-otp      → Flutter (GRAuth)
+POST  /api/v1/corporate/receive                      → Flutter (GRAuth)
 GET   /api/v1/admin/corporate/applications           → Admin JWT
 PATCH /api/v1/admin/corporate/applications/{id}      → Admin JWT
 GET   /api/v1/admin/corporate/applications/{id}/doc/{doc_type} → Admin JWT (streaming)
@@ -42,9 +43,10 @@ from app.services import corporate_application_service as svc
 from app.services import web_corporate_application_service as web_svc
 from app.repositories.corporate_application_repo import CorporateApplicationRepo
 from app.repositories.corporate_payment_repo import CorporatePaymentRepo
+from app.repositories.corporate_receive_repo import CorporateReceiveRepo
 from app.repositories.accounting_repo import AccountingRepository, normalize
 from app.models.accounting import AccountType, JournalDirection
-from app.services.netgsm_service import send_otp_sms
+from app.services.netgsm_service import send_otp_sms, send_payment_request_sms
 
 logger = get_logger(__name__)
 
@@ -392,6 +394,93 @@ async def list_web_corporate_applications(
         limit=min(limit, 200),
         offset=offset,
     )
+
+
+# ─── Flutter: Ödeme Alma Talebi Oluştur ──────────────────────────────────────
+
+class CorporateReceiveRequest(BaseModel):
+    amount:          float  = Field(..., gt=0, description="Tahsil edilecek TL tutarı")
+    recipient_tckn:  str    = Field(..., min_length=11, max_length=11)
+    recipient_phone: str    = Field(..., min_length=10, max_length=20)
+    gold_gram:       float  = Field(..., gt=0)
+    gold_type:       str    = Field(..., min_length=1, max_length=100)
+    mrz_verified:    bool   = False
+    nfc_verified:    bool   = False
+
+
+@flutter_router.post(
+    "/receive",
+    status_code=status.HTTP_201_CREATED,
+    summary="Ödeme Alma Talebi Oluştur",
+    description=(
+        "Kurumsal kullanıcı ödeme alma talebi başlatır. "
+        "Müşteriye ödeme linki ve onay SMS'i gönderilir."
+    ),
+)
+async def create_corporate_receive(
+    body: CorporateReceiveRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserDTO = Depends(get_current_user),
+) -> dict:
+    settings = get_settings()
+
+    # Kurumsal hesap kontrolü
+    app_repo = CorporateApplicationRepo(db)
+    corp_app = await app_repo.get_latest_by_user_id(current_user.id)
+    if not corp_app or corp_app.status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Bu işlem için onaylı kurumsal hesap gereklidir.",
+        )
+
+    receive_repo = CorporateReceiveRepo(db)
+    req = await receive_repo.create(
+        seller_user_id=current_user.id,
+        recipient_tckn=body.recipient_tckn,
+        recipient_phone=body.recipient_phone,
+        gold_gram=Decimal(str(body.gold_gram)),
+        gold_type=body.gold_type,
+        amount=normalize(Decimal(str(body.amount))),
+        mrz_verified=body.mrz_verified,
+        nfc_verified=body.nfc_verified,
+    )
+    await db.commit()
+
+    # Tutarı Türkçe formatlı gönder  (1234.50 → "1.234,50")
+    amount_str = f"{float(req.amount):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    sms_sent = await send_payment_request_sms(
+        phone=body.recipient_phone,
+        amount_str=amount_str,
+        payment_id=str(req.id),
+    )
+
+    if sms_sent:
+        await receive_repo.mark_sms_sent(req)
+        await db.commit()
+
+    portal_url = getattr(settings, "payment_portal_url", "https://pentorasec.online/pay")
+    pay_link = f"{portal_url}/{req.id}"
+
+    logger.info(
+        "corporate.receive.created",
+        receive_id=str(req.id),
+        sms_sent=sms_sent,
+        amount=str(req.amount),
+    )
+
+    return {
+        "receive_id": str(req.id),
+        "pay_link": pay_link,
+        "amount": float(req.amount),
+        "amount_str": amount_str,
+        "sms_sent": sms_sent,
+        "message": (
+            "Ödeme talebi oluşturuldu. Müşteriye SMS gönderildi. "
+            "Müşteri ödemeyi yapıp 'ONAYLIYORUM' SMS'i gönderdiğinde "
+            "bakiyenize yansıyacaktır."
+        ),
+    }
 
 
 # ─── Admin: Başvuruyu Getir ───────────────────────────────────────────────────

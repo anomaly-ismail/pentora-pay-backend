@@ -77,6 +77,21 @@ class AccountingRepository:
         result = await self.db.execute(stmt)
         return result.scalars().first()
 
+    async def get_user_escrow_for_update(self, user_id: uuid.UUID) -> Account | None:
+        """Kullanıcının escrow hesabını row-level lock ile çeker."""
+        stmt = (
+            select(Account)
+            .where(
+                Account.user_id == user_id,
+                Account.type == AccountType.LIABILITY,
+                Account.currency == "TRY",
+                Account.name == "escrow",
+            )
+            .with_for_update()
+        )
+        result = await self.db.execute(stmt)
+        return result.scalars().first()
+
     async def get_or_create_system_account(
         self,
         name: str,

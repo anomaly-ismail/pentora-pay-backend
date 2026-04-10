@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     netgsm_usercode: str = ""
     netgsm_password: str = ""
     netgsm_header:   str = "PentoraPay"
+    # Netgsm gelen SMS webhook gizli token — URL query param olarak iletilir
+    # Üretim: python -c "import secrets; print(secrets.token_urlsafe(32))"
+    netgsm_sms_reply_secret: str = ""
+
+    # ── Ödeme Portalı ─────────────────────────────────────────────────────────
+    # PayTR ödeme linki tabanı — {id} payment_id ile tamamlanır
+    payment_portal_url: str = "https://pentorasec.online/pay"
 
     # ── Validators ──────────────────────────────────────────────────────────────
 
