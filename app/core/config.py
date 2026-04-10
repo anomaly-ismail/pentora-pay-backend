@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     # ── Push Notifications (Firebase Admin SDK) ───────────────────────────────
     firebase_service_account_file: str = "pentora-pay-firebase-adminsdk-fbsvc-ea94983dab.json"
 
+    # ── Netgsm SMS (OTP gönderimi) ───────────────────────────────────────────
+    netgsm_usercode: str = ""
+    netgsm_password: str = ""
+    netgsm_header:   str = "PentoraPay"
+
     # ── Validators ──────────────────────────────────────────────────────────────
 
     @field_validator("pentora_signature_secret", "pentora_grauth_secret", "tckn_pepper")

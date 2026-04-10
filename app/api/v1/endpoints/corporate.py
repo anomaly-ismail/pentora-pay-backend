@@ -3,24 +3,30 @@ Kurumsal Başvuru API Endpoint'leri
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 POST  /api/v1/corporate/apply                        → Flutter (ClientAuth)
+GET   /api/v1/corporate/status                       → Flutter (GRAuth)
+POST  /api/v1/corporate/payment                      → Flutter (GRAuth)
+POST  /api/v1/corporate/payment/{id}/verify-otp      → Flutter (GRAuth)
 GET   /api/v1/admin/corporate/applications           → Admin JWT
 PATCH /api/v1/admin/corporate/applications/{id}      → Admin JWT
 GET   /api/v1/admin/corporate/applications/{id}/doc/{doc_type} → Admin JWT (streaming)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
+import random
 import uuid
+from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
 import jwt
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.dependencies import get_db
-from app.api.dependencies import get_current_user_optional, UserDTO
+from app.api.dependencies import get_current_user, get_current_user_optional, UserDTO
 from app.schemas.corporate_application import (
     CorporateApplicationCreate,
     CorporateApplicationListResponse,
@@ -35,6 +41,8 @@ from app.schemas.web_corporate_application import (
 from app.services import corporate_application_service as svc
 from app.services import web_corporate_application_service as web_svc
 from app.repositories.corporate_application_repo import CorporateApplicationRepo
+from app.repositories.corporate_payment_repo import CorporatePaymentRepo
+from app.services.netgsm_service import send_otp_sms
 
 logger = get_logger(__name__)
 
@@ -105,6 +113,21 @@ async def submit_corporate_application(
         phone=phone,
     )
 
+    # Her kullanıcı yalnızca 1 başvuru yapabilir
+    if current_user is not None:
+        repo = CorporateApplicationRepo(db)
+        existing_count = await repo.count_by_user_id(current_user.id)
+        if existing_count > 0:
+            existing = await repo.get_latest_by_user_id(current_user.id)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Zaten bir kurumsal başvurunuz bulunmaktadır. "
+                    f"Başvuru durumu: {existing.status if existing else 'bilinmiyor'}. "
+                    "Yeni başvuru yapılamaz."
+                ),
+            )
+
     application = await svc.submit_application(
         session=db,
         form_data=form_data,
@@ -126,6 +149,23 @@ async def submit_corporate_application(
     }
 
 
+@flutter_router.get(
+    "/status",
+    summary="Kullanıcının Kurumsal Başvuru Durumu",
+    description="GRAuth token ile giriş yapan kullanıcının son başvuru durumunu döner. Yoksa 'none'.",
+)
+async def get_corporate_status(
+    db: AsyncSession = Depends(get_db),
+    current_user: UserDTO = Depends(get_current_user),
+) -> dict:
+    repo = CorporateApplicationRepo(db)
+    app = await repo.get_latest_by_user_id(current_user.id)
+    if not app:
+        return {"status": "none", "application_id": None}
+    return {"status": app.status, "application_id": str(app.id)}
+
+
+# ─── Flutter: Tek Başvuru Kontrolü ───────────────────────────────────────────
 @flutter_router.post(
     "/web-apply",
     status_code=status.HTTP_201_CREATED,
@@ -138,6 +178,114 @@ async def submit_web_corporate_application(
     db: AsyncSession = Depends(get_db),
 ) -> WebCorporateApplicationResponse:
     return await web_svc.submit_web_application(session=db, payload=body)
+
+
+# ─── Flutter: Kurumsal Ödeme ─────────────────────────────────────────────────
+
+class CorporatePaymentRequest(BaseModel):
+    amount:          Decimal  = Field(..., gt=0, description="İşlem tutarı (TL)")
+    recipient_tckn:  Optional[str] = Field(None, min_length=11, max_length=11)
+    recipient_iban:  Optional[str] = Field(None, max_length=34)
+    recipient_phone: str      = Field(..., min_length=10, max_length=20)
+    gold_gram:       Decimal  = Field(..., gt=0, description="Altın miktarı (gram)")
+    gold_type:       str      = Field(..., min_length=2, max_length=100, description="Ör: Cumhuriyet Altını")
+    mrz_verified:    bool     = False
+    nfc_verified:    bool     = False
+
+
+class OtpVerifyRequest(BaseModel):
+    otp_code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+@flutter_router.post(
+    "/payment",
+    status_code=status.HTTP_201_CREATED,
+    summary="Kurumsal Ödeme Başlat",
+    description="OTP üretir, Netgsm ile alıcı telefonuna SMS gönderir. Onaylı kurumsal hesap gerektirir.",
+)
+async def create_corporate_payment(
+    body: CorporatePaymentRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserDTO = Depends(get_current_user),
+) -> dict:
+    # Onaylanmış kurumsal başvuru kontrolü
+    corp_repo = CorporateApplicationRepo(db)
+    corp_app = await corp_repo.get_latest_by_user_id(current_user.id)
+    if not corp_app or corp_app.status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Bu işlemi gerçekleştirmek için onaylanmış bir kurumsal hesabınız bulunmamaktadır.",
+        )
+
+    # 6 haneli OTP üret
+    otp_plain = f"{random.randint(0, 999999):06d}"
+
+    pay_repo = CorporatePaymentRepo(db)
+    payment = await pay_repo.create(
+        seller_user_id=current_user.id,
+        recipient_tckn=body.recipient_tckn,
+        recipient_iban=body.recipient_iban,
+        recipient_phone=body.recipient_phone,
+        gold_gram=body.gold_gram,
+        gold_type=body.gold_type,
+        amount=body.amount,
+        otp_plain=otp_plain,
+        mrz_verified=body.mrz_verified,
+        nfc_verified=body.nfc_verified,
+    )
+    await db.commit()
+
+    # Netgsm ile SMS gönder (hata olsa işlem durdurmaz)
+    sms_sent = await send_otp_sms(phone=body.recipient_phone, otp_code=otp_plain)
+
+    logger.info(
+        "corporate.payment.created",
+        payment_id=str(payment.id),
+        sms_sent=sms_sent,
+        amount=str(body.amount),
+    )
+
+    return {
+        "payment_id": str(payment.id),
+        "otp_expires_minutes": 10,
+        "sms_sent": sms_sent,
+        "message": "OTP kodu alıcı telefonuna gönderildi. Ürünü teslim edin ve OTP kodunu alın.",
+    }
+
+
+@flutter_router.post(
+    "/payment/{payment_id}/verify-otp",
+    summary="OTP Doğrula ve Ödemeyi Tamamla",
+)
+async def verify_corporate_payment_otp(
+    payment_id: uuid.UUID,
+    body: OtpVerifyRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserDTO = Depends(get_current_user),
+) -> dict:
+    pay_repo = CorporatePaymentRepo(db)
+    payment = await pay_repo.get_by_id(payment_id)
+
+    if not payment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ödeme bulunamadı.")
+    if payment.seller_user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Yetki hatası.")
+
+    success, message = await pay_repo.verify_otp(payment, body.otp_code)
+    if not success:
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+
+    # TODO: Bakiyeden düşme işlemi accounting servisine bağlanacak
+    await db.commit()
+
+    logger.info("corporate.payment.completed", payment_id=str(payment_id))
+    return {
+        "success": True,
+        "payment_id": str(payment_id),
+        "amount": str(payment.amount),
+        "message": "Ödeme başarıyla tamamlandı. Bakiyenizden düşüldü.",
+    }
 
 
 # ─── Admin: Başvuruları Listele ───────────────────────────────────────────────

@@ -11,6 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.corporate_application import ApplicationStatus, CorporateApplication
 
 
+
+
+
 class CorporateApplicationRepo:
 
     def __init__(self, session: AsyncSession) -> None:
@@ -71,6 +74,24 @@ class CorporateApplicationRepo:
         total = (await self._session.execute(count_stmt)).scalar_one()
         result = (await self._session.execute(stmt)).scalars().all()
         return total, list(result)
+
+    async def get_latest_by_user_id(self, user_id: uuid.UUID) -> Optional[CorporateApplication]:
+        """Kullanıcının en son başvurusunu döner (varsa)."""
+        result = await self._session.execute(
+            select(CorporateApplication)
+            .where(CorporateApplication.user_id == user_id)
+            .order_by(CorporateApplication.submitted_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def count_by_user_id(self, user_id: uuid.UUID) -> int:
+        """Kullanıcının toplam başvuru sayısını döner."""
+        result = await self._session.execute(
+            select(func.count()).select_from(CorporateApplication)
+            .where(CorporateApplication.user_id == user_id)
+        )
+        return result.scalar_one()
 
     async def get_by_id(self, app_id: uuid.UUID) -> Optional[CorporateApplication]:
         result = await self._session.execute(
