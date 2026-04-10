@@ -16,6 +16,7 @@ from app.middleware.request_id import RequestIDMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.middleware.client_auth import ClientAuthMiddleware
 from app.api.v1.router import router as v1_router
+from app.api.payment_portal import router as payment_portal_router
 
 settings = get_settings()
 
@@ -137,6 +138,8 @@ app.add_middleware(
 # Route'lar
 # ─────────────────────────────────────────────────────────────────────────────
 app.include_router(v1_router, prefix="/api/v1")
+# Ödeme portalı — /pay/{id} — ClientAuth bypass edilmiş (müşteri tarayıcısı)
+app.include_router(payment_portal_router)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
