@@ -498,7 +498,9 @@ async def get_receive_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ödeme talebi bulunamadı")
     if req.seller_user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Yetkisiz erişim")
-    return {"status": req.status.value}
+    # status alanı DB'de string olarak saklanabilir, enum ya da str olabilir
+    status_val = req.status.value if hasattr(req.status, "value") else req.status
+    return {"status": status_val}
 
 
 # ─── Admin: Başvuruyu Getir ───────────────────────────────────────────────────
