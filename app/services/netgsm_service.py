@@ -39,6 +39,7 @@ async def send_otp_sms(*, phone: str, otp_code: str) -> bool:
             "netgsm.otp.skipped",
             reason="Netgsm kimlik bilgileri ayarlanmamış. OTP gönderilmedi.",
             phone=phone[-4:],
+            dev_otp=f"[DEV MODE] Generated OTP: {otp_code}",
         )
         return False
 
