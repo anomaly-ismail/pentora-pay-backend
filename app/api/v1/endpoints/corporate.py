@@ -486,7 +486,7 @@ async def create_corporate_receive(
 # ─── GET /corporate/receive/{receive_id}/status ───────────────────────────────
 # Flutter bu endpoint'i periyodik olarak poll eder (5 sn'de bir)
 
-@corp_router.get("/receive/{receive_id}/status")
+@flutter_router.get("/receive/{receive_id}/status")
 async def get_receive_status(
     receive_id: uuid.UUID,
     current_user: UserDTO = Depends(get_current_user),
