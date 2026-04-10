@@ -56,11 +56,11 @@ _BYPASS_PATHS = frozenset({
 
 # Prefix bazlı bypass: bu path'lerle başlayan rotalar ClientAuth'dan muaf
 # Admin rotaları → JWT ile korunur (require_admin_jwt dependency)
-# Corporate apply → Flutter handshake header'larını kendi taşıyor; bu middleware
-#   sadece UA+signature kontrolü yapar, o kontrol aşağıda zaten devam eder.
-#   Ancak /api/v1/admin/* tarayıcıdan geldiği için Flutter UA check'i bypass gerekiyor.
+# /pay/* → müşteri ödeme portalı, tarayıcıdan erişilir, Flutter UA yoktur
 _BYPASS_PREFIXES = (
-    "/api/v1/admin/",      # Tüm admin rotaları — tarayıcı/JWT ile erişilir
+    "/api/v1/admin/",          # Tüm admin rotaları — tarayıcı/JWT ile erişilir
+    "/pay/",                   # Müşteri ödeme portalı — tarayıcı tabanlı
+    "/api/v1/webhooks/",       # PayTR + Netgsm webhook'ları — kendi HMAC güvenliği var
 )
 
 _FLUTTER_UA_KEYWORDS = ("Dart/", "dart:", "Flutter/")
