@@ -12,6 +12,7 @@ GET  /pay/{receive_id}/fail     → Başarısız ödeme sayfası
     kullanılacak; bu endpoint kaldırılabilir veya feature flag ile korunabilir.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
+import html as _html_module
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -159,6 +160,7 @@ async def payment_page(
         """, "Ödeme Tamamlandı")
 
     if req.status == CorporateReceiveStatus.PENDING_APPROVAL:
+        safe_gold_type = _html_module.escape(req.gold_type or "")
         return _html(f"""
           <div class="card">
             <div class="logo"><div class="logo-mark">P</div>
@@ -170,7 +172,7 @@ async def payment_page(
               SMS'e <strong style="color:#69f0ae">ONAYLIYORUM</strong> yazarak işlemi tamamlayın.</p>
             <div class="info-box">
               Ödeme tutarı: <strong style="color:#f0d080">{_fmt_amount(req.amount)} TL</strong><br>
-              Ürün: {req.gold_type}
+              Ürün: {safe_gold_type}
             </div>
           </div>
         """, "Ödeme Onay Bekleniyor")
@@ -199,8 +201,11 @@ async def payment_page(
         if is_mock else ""
     )
 
-    tckn_masked = req.recipient_tckn[:3] + "****" + req.recipient_tckn[-4:] \
-        if req.recipient_tckn and len(req.recipient_tckn) >= 8 else "—"
+    tckn_raw = req.recipient_tckn or ""
+    tckn_masked = _html_module.escape(
+        tckn_raw[:3] + "****" + tckn_raw[-4:] if len(tckn_raw) >= 8 else "—"
+    )
+    safe_gold_type = _html_module.escape(req.gold_type or "")
 
     return _html(f"""
       <div class="card">
@@ -226,7 +231,7 @@ async def payment_page(
         <div class="details-card">
           <div class="detail-row">
             <span class="detail-label">Ürün</span>
-            <span class="detail-value">{req.gold_type}</span>
+            <span class="detail-value">{safe_gold_type}</span>
           </div>
           <div class="detail-row">
             <span class="detail-label">Miktar</span>

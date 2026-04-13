@@ -34,6 +34,10 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
+# M-1: Netgsm webhook URL'i — token path segment olarak gömülüdür.
+# Netgsm panelinde URL'yi şu şekilde yapılandırın:
+#   https://api.pentorasec.com.tr/api/v1/webhooks/netgsm/{NETGSM_SMS_REPLY_SECRET}/sms-reply
+
 
 # ─── PayTR Webhook ────────────────────────────────────────────────────────────
 
@@ -156,27 +160,28 @@ async def paytr_callback(
 # ─── Netgsm SMS Reply Webhook ─────────────────────────────────────────────────
 
 @router.get(
-    "/netgsm/sms-reply",
+    "/netgsm/{sms_token}/sms-reply",
     summary="Netgsm Gelen SMS (ONAYLIYORUM)",
     description=(
+        "M-1: Token artık URL path segment olarak gömülüdür (query param yerine). "
         "Netgsm, müşteri 'ONAYLIYORUM' SMS'i gönderdiğinde bu URL'e GET isteği atar. "
-        "Gizli token + gönderen numarası doğrulanır. "
+        "Gizli path token + gönderen numarası doğrulanır. "
         "Onaylanırsa escrow → Ana Cüzdan transferi yapılır."
     ),
     include_in_schema=False,
 )
 async def netgsm_sms_reply(
+    sms_token: str,                                  # M-1: query param → path segment
     request: Request,
-    token:  str = Query(..., description="NETGSM_SMS_REPLY_SECRET"),
-    no:     str = Query(..., description="Gönderen telefon numarası"),
-    msg:    str = Query(..., description="SMS içeriği"),
+    no:  str = Query(..., description="Gönderen telefon numarası"),
+    msg: str = Query(..., description="SMS içeriği"),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     settings = get_settings()
     expected_token = getattr(settings, "netgsm_sms_reply_secret", "")
 
     # ── Token Doğrulama ─────────────────────────────────────────────────────
-    if not expected_token or not hmac.compare_digest(token, expected_token):
+    if not expected_token or not hmac.compare_digest(sms_token, expected_token):
         logger.warning(
             "netgsm.sms_reply.invalid_token",
             source_ip=request.client.host if request.client else "unknown",

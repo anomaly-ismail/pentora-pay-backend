@@ -18,8 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
-import jwt
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import APIRouter, Cookie, Depends, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,27 +58,30 @@ admin_corp_router = APIRouter(prefix="/admin/corporate", tags=["Admin · Corpora
 
 
 # ─── Admin JWT Doğrulama Bağımlılığı ─────────────────────────────────────────
-async def require_admin_jwt(authorization: str = Header(...)) -> dict:
+async def require_admin_jwt(
+    authorization: Optional[str] = Header(None),
+    admin_token: Optional[str] = Cookie(None),
+) -> dict:
     """
-    Authorization: Bearer <admin_token> header'ını doğrular.
-    Token admin SSO login'den alınır.
+    H-5: Authorization header VEYA admin_token httpOnly cookie'den JWT alır.
+    H-6: verify_admin_token blacklist kontrolü içerir.
+    L-4: ES256 / HS256 verify_admin_token içinde yönetilir.
     """
-    settings = get_settings()
-    if not authorization.startswith("Bearer "):
+    from app.services.admin_service import verify_admin_token
+
+    token = ""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+    elif admin_token:
+        token = admin_token
+
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Geçersiz yetkilendirme formatı",
+            detail="Yetkilendirme token'ı gereklidir",
         )
-    token = authorization.removeprefix("Bearer ").strip()
-    try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
-        if payload.get("role") != "admin":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Yetki yetersiz")
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token süresi dolmuş")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Geçersiz token")
+
+    return verify_admin_token(token)
 
 
 # ─── Flutter: Başvuru Gönder ──────────────────────────────────────────────────
@@ -221,6 +223,17 @@ async def create_corporate_payment(
             detail="Bu işlemi gerçekleştirmek için onaylanmış bir kurumsal hesabınız bulunmamaktadır.",
         )
 
+    # M-2: nfc_verified ve mrz_verified server-side cross-check
+    # Flutter'dan gelen değer; DB'deki gerçek kullanıcı durumu ile çapraz kontrol edilir.
+    if body.nfc_verified and not current_user.nfc_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "nfc_verified=true talep edildi ancak bu hesapta NFC doğrulaması "
+                "kayıtlı değil. Lütfen uygulamayı güncelleyin."
+            ),
+        )
+
     # 6 haneli OTP üret
     otp_plain = f"{random.randint(0, 999999):06d}"
 
@@ -257,6 +270,37 @@ async def create_corporate_payment(
     }
 
 
+@flutter_router.get(
+    "/payment/{payment_id}/status",
+    summary="Ödeme Durumunu Sorgula",
+    description=(
+        "M-9: Ağ kopması durumunda Flutter bu endpoint ile ödemenin durumunu kontrol eder. "
+        "Belirsizlik ortadan kalkar: OTP gönderildi mi, tamamlandı mı, süresi doldu mu."
+    ),
+)
+async def get_corporate_payment_status(
+    payment_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserDTO = Depends(get_current_user),
+) -> dict:
+    pay_repo = CorporatePaymentRepo(db)
+    payment = await pay_repo.get_by_id(payment_id)
+
+    if not payment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ödeme bulunamadı.")
+    if payment.seller_user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Yetki hatası.")
+
+    return {
+        "payment_id": str(payment.id),
+        "status": payment.status.value if hasattr(payment.status, "value") else str(payment.status),
+        "amount": str(payment.amount),
+        "gold_type": payment.gold_type,
+        "otp_expires_at": payment.otp_expires_at.isoformat() if payment.otp_expires_at else None,
+        "completed_at": payment.completed_at.isoformat() if payment.completed_at else None,
+    }
+
+
 @flutter_router.post(
     "/payment/{payment_id}/verify-otp",
     summary="OTP Doğrula ve Ödemeyi Tamamla",
@@ -268,7 +312,8 @@ async def verify_corporate_payment_otp(
     current_user: UserDTO = Depends(get_current_user),
 ) -> dict:
     pay_repo = CorporatePaymentRepo(db)
-    payment = await pay_repo.get_by_id(payment_id)
+    # C-2: get_by_id yerine get_by_id_for_update — TOCTOU race condition önlemi
+    payment = await pay_repo.get_by_id_for_update(payment_id)
 
     if not payment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ödeme bulunamadı.")

@@ -23,3 +23,7 @@ httptools==0.6.4
 sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
 alembic==1.14.0
+
+# H-2: Redis (opsiyonel — multi-worker rate limit + handshake store)
+# REDIS_URL env değişkeni ayarlıysa aktif olur
+redis>=5.0.0

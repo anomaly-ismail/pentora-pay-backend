@@ -99,10 +99,11 @@ class CorporateApplication(Base):
         comment="Başvuran kişi adı soyadı",
     )
 
+    # L-5: Plaintext TCKN yerine HMAC hash saklanır (128 hex karakter)
     applicant_tckn: Mapped[str | None] = mapped_column(
-        String(11),
+        String(128),
         nullable=True,
-        comment="Başvuran kişinin TCKN değeri (admin doğrulama için)",
+        comment="Başvuran kişinin TCKN HMAC-SHA3-512 hash değeri (plaintext değil)",
     )
 
     phone: Mapped[str] = mapped_column(

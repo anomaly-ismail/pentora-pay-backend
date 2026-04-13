@@ -1,9 +1,9 @@
+import asyncio
 import hashlib
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from threading import Lock
 from typing import Optional
 
 from fastapi import Request, Depends, HTTPException, status
@@ -24,8 +24,6 @@ optional_security = HTTPBearer(auto_error=False)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UserDTO — cache'e giren hafif veri nesnesi.
-# SQLAlchemy ORM nesnesi değil; session bağımlılığı yok, pickle-safe.
-# Endpoint'lerin ihtiyaç duyduğu alanlar: id, is_active, nfc_verified, tckn_hash.
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass(slots=True, frozen=True)
 class UserDTO:
@@ -37,26 +35,27 @@ class UserDTO:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Token → UserDTO in-memory cache
-# Güvenlik: yalnızca token_hash saklanır (plaintext token asla cache'e girmez).
-# TTL: 60 sn — revoke işlemleri en fazla 60 sn gecikmeli yansır.
+# M-7: threading.Lock → asyncio.Lock (async context uyumlu)
 # ─────────────────────────────────────────────────────────────────────────────
 _SESSION_CACHE_TTL = 60  # saniye
 
-# cache entry: (UserDTO, cached_at_monotonic, session_expires_at)
 _CacheEntry = tuple[UserDTO, float, datetime]
 
 
 class _SessionCache:
-    """Thread-safe, TTL-tabanlı token hash → UserDTO cache."""
+    """
+    asyncio.Lock ile TTL-tabanlı token hash → UserDTO cache.
+    M-7: threading.Lock yerine asyncio.Lock kullanılır — event loop bloklaması önlenir.
+    """
 
     __slots__ = ("_store", "_lock")
 
     def __init__(self) -> None:
         self._store: dict[str, _CacheEntry] = {}
-        self._lock = Lock()
+        self._lock = asyncio.Lock()
 
-    def get(self, token_hash: str) -> Optional[tuple[UserDTO, datetime]]:
-        with self._lock:
+    async def get(self, token_hash: str) -> Optional[tuple[UserDTO, datetime]]:
+        async with self._lock:
             entry = self._store.get(token_hash)
             if entry is None:
                 return None
@@ -66,17 +65,17 @@ class _SessionCache:
                 return None
             return dto, expires_at
 
-    def set(self, token_hash: str, dto: UserDTO, expires_at: datetime) -> None:
-        with self._lock:
+    async def set(self, token_hash: str, dto: UserDTO, expires_at: datetime) -> None:
+        async with self._lock:
             self._store[token_hash] = (dto, time.monotonic(), expires_at)
 
-    def invalidate(self, token_hash: str) -> None:
-        with self._lock:
+    async def invalidate(self, token_hash: str) -> None:
+        async with self._lock:
             self._store.pop(token_hash, None)
 
-    def evict_expired(self) -> None:
+    async def evict_expired(self) -> None:
         now = time.monotonic()
-        with self._lock:
+        async with self._lock:
             expired = [k for k, v in self._store.items() if now - v[1] > _SESSION_CACHE_TTL]
             for k in expired:
                 del self._store[k]
@@ -86,6 +85,10 @@ _session_cache = _SessionCache()
 
 
 def _compute_token_hash(token_str: str, pepper: str) -> str:
+    """
+    M-6: session_pepper kullanılır (tckn_pepper'dan ayrı).
+    grauth_token_hash = SHA3-256(token || session_pepper)
+    """
     return hashlib.sha3_256(
         token_str.encode("utf-8") + pepper.encode("utf-8")
     ).hexdigest()
@@ -102,15 +105,16 @@ async def get_current_user(
     """
     token_str = credentials.credentials
     settings = get_settings()
-    token_hash = _compute_token_hash(token_str, settings.tckn_pepper)
+    # M-6: session_pepper kullan
+    token_hash = _compute_token_hash(token_str, settings.session_pepper)
 
     # ── Cache hit ────────────────────────────────────────────────────────────
-    cached = _session_cache.get(token_hash)
+    cached = await _session_cache.get(token_hash)
     if cached is not None:
         dto, expires_at = cached
         now = datetime.now(timezone.utc)
         if now > expires_at:
-            _session_cache.invalidate(token_hash)
+            await _session_cache.invalidate(token_hash)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                                 detail="Oturumunuz sonlandırılmış.")
         if not dto.is_active:
@@ -119,7 +123,6 @@ async def get_current_user(
         return dto
 
     # ── Cache miss → DB sorgusu ───────────────────────────────────────────────
-    # Sadece ihtiyaç duyulan kolonları çek: User.id, is_active, nfc_verified, tckn_hash
     stmt = (
         select(
             UserSession.expires_at,
@@ -138,7 +141,7 @@ async def get_current_user(
     row = (await db.execute(stmt)).first()
 
     if row is None:
-        logger.warning("auth.dependency.invalid_token", ip=request.client.host)
+        logger.warning("auth.dependency.invalid_token", ip=request.client.host if request.client else "unknown")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="Geçersiz veya süresi dolmuş oturum.")
 
@@ -158,7 +161,7 @@ async def get_current_user(
         nfc_verified=row.nfc_verified,
         tckn_hash=row.tckn_hash,
     )
-    _session_cache.set(token_hash, dto, row.expires_at)
+    await _session_cache.set(token_hash, dto, row.expires_at)
     return dto
 
 

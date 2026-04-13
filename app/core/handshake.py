@@ -70,8 +70,22 @@ class _HandshakeStore:
 
     async def put(self, handshake_id: str, entry: HandshakeEntry) -> None:
         async with self._lock:
-            self._store[handshake_id] = entry
+            # M-5: Maksimum store boyutunu kontrol et (DoS koruması)
+            settings = get_settings()
+            max_size = settings.handshake_store_max_size
             await self._evict_expired()
+            if len(self._store) >= max_size:
+                # Kapasiteye ulaşıldı: en erken sona erecek girişi çıkar
+                oldest_key = min(
+                    self._store, key=lambda k: self._store[k].expires_at
+                )
+                del self._store[oldest_key]
+                logger.warning(
+                    "handshake_store.evicted_oldest",
+                    store_size=len(self._store),
+                    max_size=max_size,
+                )
+            self._store[handshake_id] = entry
 
     async def get(self, handshake_id: str) -> HandshakeEntry | None:
         async with self._lock:

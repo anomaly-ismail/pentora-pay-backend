@@ -19,6 +19,20 @@ from app.schemas.auth import RegisterRequest
 
 logger = get_logger(__name__)
 
+# H-9: Dummy hash — zamanlama saldırısı koruması için kullanıcı bulunamadığında
+# bu hash ile Argon2id verify yapılır.  _pin_hasher parametreleriyle üretilmiş
+# gerçek bir hash olması zorunludur; geçersiz string farklı exception yolu açar.
+_DUMMY_PIN_HASH: str = ""
+
+
+def _get_dummy_pin_hash() -> str:
+    """Module başına bir kez _pin_hasher ile gerçek bir Argon2id hash üretir."""
+    global _DUMMY_PIN_HASH
+    if not _DUMMY_PIN_HASH:
+        from app.repositories.user_repo import _pin_hasher
+        _DUMMY_PIN_HASH = _pin_hasher.hash("__dummy_timing_protection_pin__")
+    return _DUMMY_PIN_HASH
+
 
 async def register_user(
     request: RegisterRequest,
@@ -164,11 +178,10 @@ async def login_user(
     """
     repo = UserRepository(db)
     
-    # Dummy Argon2id hash'i (Zamanlama saldırısını önlemek için)
-    # Eğer user bulunamazsa, sanki varmış gibi bu hash'le verify yapacağız.
-    # Gerçek PIN doğrulama süresini taklit eder.
-    # (Parola "dummy_pin" için oluşturulmuş örnek bir Argon2id hash).
-    dummy_hash = "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHRoZXJl$dummyhashvaluefortimingattackprotection"
+    # H-9: Dummy Argon2id hash — gerçek _pin_hasher parametreleriyle üretilmiş
+    # geçerli bir hash'tir.  Kullanıcı bulunamazsa bu hash ile verify yapılır,
+    # böylece yanıt süresi TCKN var/yok durumunda eşit kalır (Timing Attack önlemi).
+    dummy_hash = _get_dummy_pin_hash()
 
     user = await repo.get_by_tckn(request.tckn)
     user_found = user is not None

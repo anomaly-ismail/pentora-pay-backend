@@ -100,12 +100,19 @@ class AccountingRepository:
     ) -> Account:
         """
         Verilen adla sistem hesabını getirir; yoksa oluşturur.
+        H-8: SELECT FOR UPDATE ile kilitleyerek eşzamanlı oluşturma yarışını önler.
         Sistem hesapları user_id=None ve ASSET tipindedir.
         """
-        stmt = select(Account).where(
-            Account.user_id.is_(None),
-            Account.name == name,
-            Account.currency == currency,
+        # H-8: Önce FOR UPDATE ile kilitle — böylece iki eşzamanlı istek
+        # aynı anda iki sistem hesabı oluşturamaz (TOCTOU önlemi).
+        stmt = (
+            select(Account)
+            .where(
+                Account.user_id.is_(None),
+                Account.name == name,
+                Account.currency == currency,
+            )
+            .with_for_update()
         )
         result = await self.db.execute(stmt)
         account = result.scalars().first()

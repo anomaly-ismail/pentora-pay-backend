@@ -62,6 +62,8 @@ class UserRepository:
         self._db = db
         self._settings = get_settings()
         self._pepper = self._settings.tckn_pepper
+        # M-6: grauth_token_hash için tckn_pepper'dan ayrı pepper
+        self._session_pepper = self._settings.session_pepper
 
     # ── TCKN Hash Hesaplama ──────────────────────────────────────────────────
     def hash_tckn(self, tckn: str) -> str:
@@ -146,7 +148,8 @@ class UserRepository:
         session = UserSession(
             user_id=user_id,
             session_uuid=session_uuid,
-            grauth_token_hash=_sha3_256_hash(grauth_token, self._pepper),
+            # M-6: grauth_token_hash için session_pepper (tckn_pepper'dan ayrı)
+            grauth_token_hash=_sha3_256_hash(grauth_token, self._session_pepper),
             issued_at=issued_at,
             expires_at=expires_at,
             is_revoked=False,

@@ -60,9 +60,41 @@ class Settings(BaseSettings):
     jwt_access_token_expire_minutes: int = 30
     jwt_refresh_token_expire_days: int = 7
 
+    # ── OTP Pepper (C-4: unsalted SHA-256 yerine HMAC+pepper) ───────────────────
+    # HMAC-SHA256(otp_plain, otp_pepper) ile OTP hashlenir.
+    # Boşsa tckn_pepper'dan türetilir; üretimde ayrı bir değer AYARLAYINız.
+    otp_pepper: str = ""
+
+    # ── Session Pepper (M-6: tckn_pepper'dan ayrı session hash pepperı) ─────────
+    # grauth_token_hash = SHA3-256(token || session_pepper)
+    # tckn_pepper ile FARKLI olmalıdır.
+    session_pepper: str = ""
+
+    # ── Güvenilen Proxy IP'leri (H-7: X-Forwarded-For doğrulaması) ───────────────
+    # Virgülle ayrılmış IP listesi. Sadece bu IP'lerden gelen X-Forwarded-For kabul edilir.
+    # Örn: "10.0.0.1,10.0.0.2"  Boşsa X-Forwarded-For tamamen görmezden gelinir.
+    trusted_proxy_ips: str = ""
+
+    # ── Redis (H-2: multi-worker rate limit + handshake store) ───────────────────
+    # Boşsa in-memory kullanılır. Üretimde multi-worker varsa REDIS_URL ayarlayın.
+    # Örn: "redis://localhost:6379/0"
+    redis_url: str = ""
+
+    # ── Handshake Store Maksimum Boyut (M-5: DoS koruması) ──────────────────────
+    handshake_store_max_size: int = 10000
+
     # ── Admin SSO ───────────────────────────────────────────────────────────────
     admin_mail: str
     admin_pass: str
+    # H-3: Üretimde admin_pass_hash ayarlayın (Argon2id karması).
+    # Üret: python -c "from argon2 import PasswordHasher; print(PasswordHasher().hash('sifrenz'))"
+    admin_pass_hash: str = ""
+
+    # L-4: Admin JWT için ES256 anahtarları (HS256'dan daha güvenli).
+    # Üret: openssl ecparam -name prime256v1 -genkey -noout -out key.pem && openssl ec -in key.pem -pubout -out pub.pem
+    # Boşsa HS256 kullanılır (uyarı loglanır).
+    admin_jwt_private_key_pem: str = ""
+    admin_jwt_public_key_pem: str = ""
 
     # ── PostgreSQL ───────────────────────────────────────────────────────────────
     postgres_host: str = "localhost"
@@ -111,6 +143,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
+        import hashlib
         if self.app_env == "production":
             if self.debug:
                 raise ValueError("Üretimde DEBUG=true olamaz.")
@@ -118,6 +151,18 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "tckn_pepper ve pentora_grauth_secret FARKLI olmalıdır!"
                 )
+
+        # otp_pepper ve session_pepper türet (boşsa)
+        if not self.otp_pepper:
+            object.__setattr__(
+                self, "otp_pepper",
+                hashlib.sha3_256((self.tckn_pepper + ":otp_pepper_v1").encode()).hexdigest()
+            )
+        if not self.session_pepper:
+            object.__setattr__(
+                self, "session_pepper",
+                hashlib.sha3_256((self.tckn_pepper + ":session_pepper_v1").encode()).hexdigest()
+            )
         return self
 
     @property

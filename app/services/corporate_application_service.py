@@ -4,12 +4,16 @@ Kurumsal Başvuru Service
 
 Dosya güvenliği (OWASP A05):
   - İzin verilen MIME türleri: PDF, JPEG, PNG
-  - Magic bytes doğrulaması (sadece uzantıya güvenilmez)
+  - Magic bytes doğrulaması — L-6: backend'de de uygulanır (sadece uzantıya güvenilmez)
   - Maksimum dosya boyutu: 5 MB
   - Rastgele UUID ile yeniden adlandırma (path traversal önleme)
   - Belgeler public dizin dışında saklanır
+
+L-5: applicant_tckn plaintext değil HMAC-SHA3-512 hash olarak saklanır.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
+import hashlib
+import hmac as stdlib_hmac
 import uuid
 from pathlib import Path
 
@@ -35,6 +39,22 @@ logger = get_logger(__name__)
 
 # Belgeler public web root dışında saklanır
 _UPLOAD_DIR = Path("/app/uploads/corporate")
+
+
+def _hash_tckn(tckn: str | None) -> str | None:
+    """
+    L-5: applicant_tckn'yi HMAC-SHA3-512 ile hashler.
+    DB'de plaintext TCKN saklanmaz.
+    """
+    if not tckn:
+        return None
+    from app.core.config import get_settings
+    settings = get_settings()
+    return stdlib_hmac.new(
+        settings.tckn_pepper.encode("utf-8"),
+        tckn.encode("utf-8"),
+        hashlib.sha3_512,
+    ).hexdigest()
 
 # İzin verilen dosya tipleri: (MIME prefix, magic bytes)
 _ALLOWED_TYPES: dict[str, bytes] = {
@@ -126,7 +146,8 @@ async def submit_application(
             mersis_no=form_data.mersis_no,
             address=form_data.address,
             applicant_name=form_data.applicant_name,
-            applicant_tckn=form_data.applicant_tckn,
+            # L-5: plaintext TCKN yerine HMAC hash sakla
+            applicant_tckn=_hash_tckn(form_data.applicant_tckn),
             phone=form_data.phone,
             vergi_levhasi_path=vergi_path,
             imza_sirkuleri_path=imza_path,

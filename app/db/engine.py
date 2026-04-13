@@ -112,9 +112,15 @@ async def create_all_tables() -> None:
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Geriye dönük uyumluluk: mevcut tabloda yeni kolonlar eksikse ekle
+        # L-5: applicant_tckn artık HMAC-SHA3-512 hash saklar (128 hex karakter)
         await conn.exec_driver_sql(
             "ALTER TABLE corporate_applications "
-            "ADD COLUMN IF NOT EXISTS applicant_tckn VARCHAR(11)"
+            "ADD COLUMN IF NOT EXISTS applicant_tckn VARCHAR(128)"
+        )
+        # Mevcut VARCHAR(11) kolonunu VARCHAR(128)'e yükselt (zaten varsa)
+        await conn.exec_driver_sql(
+            "ALTER TABLE corporate_applications "
+            "ALTER COLUMN applicant_tckn TYPE VARCHAR(128)"
         )
         await conn.exec_driver_sql(
             "CREATE TABLE IF NOT EXISTS web_corporate_applications ("

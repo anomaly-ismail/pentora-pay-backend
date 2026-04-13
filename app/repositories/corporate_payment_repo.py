@@ -2,6 +2,7 @@
 Kurumsal Ödeme Repository
 """
 import hashlib
+import hmac as stdlib_hmac
 import uuid
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -10,7 +11,20 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.models.corporate_payment import CorporatePayment, CorporatePaymentStatus
+
+
+def _hash_otp(otp_plain: str, pepper: str) -> str:
+    """
+    C-4: OTP'yi unsalted SHA-256 yerine HMAC-SHA256(otp, pepper) ile hashler.
+    Pepper sunucu tarafında saklandığından rainbow table saldırıları engellenir.
+    """
+    return stdlib_hmac.new(
+        pepper.encode("utf-8"),
+        otp_plain.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 class CorporatePaymentRepo:
@@ -18,6 +32,8 @@ class CorporatePaymentRepo:
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+        settings = get_settings()
+        self._otp_pepper = settings.otp_pepper
 
     async def create(
         self,
@@ -33,7 +49,8 @@ class CorporatePaymentRepo:
         mrz_verified: bool = False,
         nfc_verified: bool = False,
     ) -> CorporatePayment:
-        otp_hash = hashlib.sha256(otp_plain.encode()).hexdigest()
+        # C-4: HMAC-SHA256 ile OTP hash (unsalted SHA-256 yerine)
+        otp_hash = _hash_otp(otp_plain, self._otp_pepper)
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=self._OTP_TTL_MINUTES)
 
         payment = CorporatePayment(
@@ -61,6 +78,18 @@ class CorporatePaymentRepo:
         )
         return result.scalar_one_or_none()
 
+    async def get_by_id_for_update(self, payment_id: uuid.UUID) -> Optional[CorporatePayment]:
+        """
+        C-2: OTP doğrulaması öncesi row-level lock ile çeker (TOCTOU önlemi).
+        Eşzamanlı OTP denemelerini serialize eder.
+        """
+        result = await self._session.execute(
+            select(CorporatePayment)
+            .where(CorporatePayment.id == payment_id)
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
     async def verify_otp(
         self,
         payment: CorporatePayment,
@@ -83,8 +112,9 @@ class CorporatePaymentRepo:
             await self._session.flush()
             return False, "Çok fazla hatalı deneme. İşlem iptal edildi."
 
-        entered_hash = hashlib.sha256(otp_plain.encode()).hexdigest()
-        if entered_hash != payment.otp_code_hash:
+        # C-4: Girilen OTP'yi HMAC ile hashle ve saklananla karşılaştır
+        entered_hash = _hash_otp(otp_plain, self._otp_pepper)
+        if not stdlib_hmac.compare_digest(entered_hash, payment.otp_code_hash):
             payment.otp_attempts += 1
             await self._session.flush()
             remaining = 5 - payment.otp_attempts

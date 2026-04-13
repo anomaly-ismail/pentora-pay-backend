@@ -1,11 +1,15 @@
-"""Auth Endpoint'leri — Handshake ve Kayıt."""
-from fastapi import APIRouter, Depends, Request, status
+"""Auth Endpoint'leri — Handshake, Kayıt, Giriş, Çıkış."""
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import update
 
 from app.core.handshake import HandshakeError, perform_handshake
 from app.core.logging import get_logger
+from app.core.config import get_settings
 from app.db.dependencies import get_db
+from app.models.user_session import UserSession
 from app.schemas.auth import (
     HandshakeRequest,
     HandshakeResponse,
@@ -15,9 +19,11 @@ from app.schemas.auth import (
     LoginResponse,
 )
 from app.services.auth_service import register_user, login_user
+from app.api.dependencies import UserDTO, _compute_token_hash, _session_cache, get_current_user
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 logger = get_logger(__name__)
+_bearer = HTTPBearer()
 
 
 @router.post(
@@ -140,3 +146,43 @@ async def login(
         expires_in=grauth_result.expires_at - grauth_result.issued_at,
         nfc_verified=True, # Backend login başarılıysa hesap her zaman NFC verified'dır
     )
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_200_OK,
+    summary="Oturum Kapat",
+    description="M-4: GRAuth token'ı geçersiz kılar (DB revoke + cache temizle).",
+)
+async def logout(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserDTO = Depends(get_current_user),
+) -> dict:
+    """
+    M-4: Logout endpoint.
+    1. Token hash hesapla
+    2. DB'de session'ı revoke et
+    3. In-memory cache'i temizle
+    """
+    settings = get_settings()
+    token_str = credentials.credentials
+    token_hash = _compute_token_hash(token_str, settings.session_pepper)
+
+    # DB: session'ı revoke et
+    await db.execute(
+        update(UserSession)
+        .where(
+            UserSession.grauth_token_hash == token_hash,
+            UserSession.is_revoked.is_(False),
+        )
+        .values(is_revoked=True)
+    )
+    await db.commit()
+
+    # Cache'den temizle (anlık etki)
+    await _session_cache.invalidate(token_hash)
+
+    logger.info("auth.logout.success", user_id=str(current_user.id))
+    return {"message": "Oturum başarıyla sonlandırıldı."}

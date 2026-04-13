@@ -30,6 +30,39 @@ async def lifespan(app: FastAPI):
     # Kriptografik ortam öz-testi — hata varsa başlatmayı durdur
     assert_crypto_environment()
 
+    # H-2: Multi-worker + Redis uyarısı
+    if settings.workers > 1 and not settings.redis_url:
+        logger.warning(
+            "startup.rate_limit.multiworker_no_redis",
+            workers=settings.workers,
+            hint=(
+                "workers > 1 iken REDIS_URL ayarlı değil. "
+                "Rate limiting ve handshake store her worker'da ayrı çalışır. "
+                "Üretimde REDIS_URL ayarlayın veya workers=1 kullanın."
+            ),
+        )
+
+    # H-3: Admin şifre hash uyarısı
+    if not settings.admin_pass_hash:
+        logger.warning(
+            "startup.admin.no_pass_hash",
+            hint=(
+                "ADMIN_PASS_HASH ayarlı değil. Argon2id hash önerilen yöntemdir. "
+                "Üret: python -c \"from argon2 import PasswordHasher; "
+                "print(PasswordHasher().hash('sifrenz'))\""
+            ),
+        )
+
+    # L-4: Admin JWT HS256 uyarısı
+    if not settings.admin_jwt_private_key_pem:
+        logger.warning(
+            "startup.admin_jwt.hs256_in_use",
+            hint=(
+                "ADMIN_JWT_PRIVATE_KEY_PEM ayarlı değil — HS256 kullanılıyor. "
+                "Üretimde ES256 için openssl ile P-256 anahtar çifti oluşturun."
+            ),
+        )
+
     # Tüm ortamlarda eksik tabloları oluştur (CREATE TABLE IF NOT EXISTS — idempotent, güvenli)
     # Var olan tablolara ve veriye dokunmaz; yalnızca eksik olanları ekler.
     from app.db.engine import create_all_tables
@@ -147,9 +180,5 @@ app.include_router(payment_portal_router)
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/health", tags=["System"], include_in_schema=False)
 async def health():
-    return {
-        "status": "ok",
-        "app": settings.app_name,
-        "version": settings.app_version,
-        "env": settings.app_env,
-    }
+    # L-3: Versiyon ve ortam bilgisi kaldırıldı — bilgi sızıntısı önlemi
+    return {"status": "ok"}

@@ -9,6 +9,7 @@ Her HTTP yanıtına aşağıdaki header grupları eklenir:
   [D] X-Pentora-SQL        — SQL enjeksiyon tarama sonucu
   [E] X-Pentora-GRAuth     — Genel istek doğrulama durumu
   [F] İzlenebilirlik       — X-Request-ID, X-Response-Time
+  [G] X-Pentora-Response-Sig — M-3: Yanıt gövdesi session_key ile HMAC imzalanır
 
 Middleware uygulama sırası (main.py'de ters sıra ile eklenir):
   1. RequestIDMiddleware     → istek kimliği üretimi
@@ -17,6 +18,8 @@ Middleware uygulama sırası (main.py'de ters sıra ile eklenir):
   4. SecurityHeadersMiddleware → bu dosya
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
+import hashlib
+import hmac as stdlib_hmac
 import time
 from typing import Callable
 
@@ -107,6 +110,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         request_id = request.state.__dict__.get("request_id", "n/a")
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Response-Time"] = f"{elapsed_ms}ms"
+
+        # ── [G] M-3: Yanıt gövdesi HMAC (session_key ile MITM koruması) ────
+        await _apply_response_hmac(response, request)
 
         return response
 
@@ -340,3 +346,42 @@ def _apply_pentora_grauth(response: Response, request: Request) -> None:
         value = f"{auth_state.get('status', 'UNKNOWN')}; method={auth_state.get('method', 'Unknown')}"
 
     response.headers["X-Pentora-GRAuth"] = value
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [G] M-3: Response Body HMAC (session_key ile MITM koruması)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _apply_response_hmac(response: Response, request: Request) -> None:
+    """
+    M-3: Yanıt gövdesini ECDH session_key ile HMAC-SHA256 imzalar.
+    Flutter istemci, kendi session_key'ini kullanarak bu imzayı doğrulayabilir.
+
+    Format: X-Pentora-Response-Sig: v1=<hex>; ts=<unix_timestamp>
+
+    Yalnızca ECDH handshake tamamlanmış oturumlar için imzalama yapılır.
+    Streaming veya boş yanıtlar imzalanmaz (güvenli default).
+    """
+    handshake_id = getattr(request.state, "handshake_id", None)
+    if not handshake_id:
+        return  # Handshake yoksa (admin, ödeme portalı vb.) imzalama atla
+
+    try:
+        from app.core.handshake import get_session_key
+        session_key = await get_session_key(handshake_id)
+        if not session_key:
+            return
+
+        # Yanıt gövdesini al (BaseHTTPMiddleware buffer'lar — streaming hariç)
+        resp_body: bytes = b""
+        if hasattr(response, "body") and isinstance(response.body, bytes):
+            resp_body = response.body
+
+        ts = int(time.time())
+        # HMAC-SHA256(ts:response_body, session_key)
+        message = f"{ts}:".encode() + resp_body
+        sig = stdlib_hmac.new(session_key, message, hashlib.sha256).hexdigest()
+        response.headers["X-Pentora-Response-Sig"] = f"v1={sig}; ts={ts}"
+
+    except Exception as exc:
+        logger.debug("response_hmac.skipped", reason=str(exc))
