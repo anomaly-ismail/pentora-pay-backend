@@ -155,7 +155,10 @@ class AccountingRepository:
         await self.db.flush()
 
         # 3. Yevmiye kayıtları ve Account Bakiye güncellemeleri
-        for req in entries:
+        # PERF-2: Deadlock önlemi — tüm eşzamanlı işlemler account_id sırasına göre
+        # kilit aldığında dairesel bekleme (circular wait) oluşamaz.
+        sorted_entries = sorted(entries, key=lambda e: str(e["account_id"]))
+        for req in sorted_entries:
             amount = normalize(req["amount"])   # Banker's rounding — küsürat kayması yok
             if amount <= 0:
                 raise ValueError("Journal entry amount must be strictly positive.")

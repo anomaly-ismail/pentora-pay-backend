@@ -45,6 +45,7 @@ from app.repositories.corporate_payment_repo import CorporatePaymentRepo
 from app.repositories.corporate_receive_repo import CorporateReceiveRepo
 from app.repositories.accounting_repo import AccountingRepository, normalize
 from app.models.accounting import AccountType, JournalDirection
+from app.models.user import User
 from app.services.netgsm_service import send_otp_sms, send_payment_request_sms
 
 logger = get_logger(__name__)
@@ -624,13 +625,23 @@ async def download_document(
     mime_map = {".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
     media_type = mime_map.get(suffix, "application/octet-stream")
 
-    def _iter():
-        with p.open("rb") as f:
-            while chunk := f.read(65536):  # 64KB chunks
-                yield chunk
+    # BUG-2 FIX: Senkron dosya IO event loop'u bloklar.
+    # asyncio.to_thread ile dosya okuma thread pool'a alınır.
+    async def _async_iter():
+        import asyncio
+        def _read_chunks():
+            with p.open("rb") as f:
+                while True:
+                    chunk = f.read(65536)  # 64KB
+                    if not chunk:
+                        break
+                    yield chunk
+        # Tüm dosyayı arka plan thread'inde oku, ardından stream et
+        data = await asyncio.to_thread(p.read_bytes)
+        yield data
 
     return StreamingResponse(
-        _iter(),
+        _async_iter(),
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{doc_type}_{app_id}.{suffix.lstrip(".")}"'},
     )

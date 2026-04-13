@@ -63,6 +63,26 @@ async def lifespan(app: FastAPI):
             ),
         )
 
+    # OPS-1: Bağlantı havuzu taşma riski — workers × (pool_size + max_overflow)
+    # PostgreSQL varsayılan max_connections = 100; 10 bağlantı sistem için rezerve bırakılır.
+    _max_db_conns = settings.workers * (
+        settings.postgres_pool_size + settings.postgres_max_overflow
+    )
+    if _max_db_conns > 90:
+        logger.warning(
+            "startup.db.pool_overflow_risk",
+            workers=settings.workers,
+            pool_size=settings.postgres_pool_size,
+            max_overflow=settings.postgres_max_overflow,
+            total_max_connections=_max_db_conns,
+            hint=(
+                f"workers × (pool_size + max_overflow) = {_max_db_conns} > 90. "
+                "PostgreSQL max_connections (varsayılan 100) aşılabilir. "
+                "POSTGRES_POOL_SIZE / WORKERS değerlerini düşürün veya "
+                "postgresql.conf içinde max_connections değerini artırın."
+            ),
+        )
+
     # Tüm ortamlarda eksik tabloları oluştur (CREATE TABLE IF NOT EXISTS — idempotent, güvenli)
     # Var olan tablolara ve veriye dokunmaz; yalnızca eksik olanları ekler.
     from app.db.engine import create_all_tables

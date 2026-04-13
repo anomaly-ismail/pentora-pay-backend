@@ -116,8 +116,8 @@ class UserSession(Base):
             "user_id", "expires_at",
             postgresql_where=text("is_revoked = false"),
         ),
-        # Token hash lookup — her auth isteğinde kullanılır, index zorunlu
-        Index("ix_sessions_token_hash", "grauth_token_hash", unique=True),
+        # ix_sessions_token_hash Alembic migration a1b2c3d4e5f6 tarafından oluşturulur.
+        # Burada tekrar tanımlamak "relation already exists" hatasına yol açar.
     )
 
     def __repr__(self) -> str:
