@@ -102,6 +102,7 @@ async def register(
         client_ip=client_ip,
         user_agent=user_agent,
     )
+    await db.commit()
 
     return RegisterResponse(
         grauth_token=grauth_result.token,
@@ -139,6 +140,7 @@ async def login(
         client_ip=client_ip,
         user_agent=user_agent,
     )
+    await db.commit()
 
     return LoginResponse(
         grauth_token=grauth_result.token,
