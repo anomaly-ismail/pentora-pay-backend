@@ -30,6 +30,13 @@ import app.models.user
 import app.models.user_session
 import app.models.audit_event
 import app.models.accounting
+import app.models.corporate_application  # noqa: F401
+import app.models.corporate_payment  # noqa: F401
+import app.models.corporate_receive_request  # noqa: F401
+import app.models.web_corporate_application  # noqa: F401
+import app.models.notification  # noqa: F401
+import app.models.user_device  # noqa: F401
+import app.models.mrtd_session  # noqa: F401
 
 target_metadata = Base.metadata
 

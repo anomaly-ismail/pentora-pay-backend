@@ -96,6 +96,14 @@ class CorporatePayment(Base):
     mrz_verified: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
     nfc_verified:  Mapped[bool] = mapped_column(default=False, server_default=text("false"))
 
+    # MRTD oturum bağlantısı (şifreli MRZ + DG dosyaları burada tutulur)
+    mrtd_session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+        comment="mrtd_sessions.id — approve_id ile audit zinciri",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

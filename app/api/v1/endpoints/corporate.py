@@ -4,9 +4,11 @@ Kurumsal Başvuru API Endpoint'leri
 
 POST  /api/v1/corporate/apply                        → Flutter (ClientAuth)
 GET   /api/v1/corporate/status                       → Flutter (GRAuth)
-POST  /api/v1/corporate/payment                      → Flutter (GRAuth)
+POST  /api/v1/corporate/mrtd/session                 → Flutter (GRAuth)  [MRZ + BAC keys]
+POST  /api/v1/corporate/mrtd/session/{id}/nfc        → Flutter (GRAuth)  [DG1/DG2/DG11/SOD]
+POST  /api/v1/corporate/payment                      → Flutter (GRAuth)  [approve_id ile]
 POST  /api/v1/corporate/payment/{id}/verify-otp      → Flutter (GRAuth)
-POST  /api/v1/corporate/receive                      → Flutter (GRAuth)
+POST  /api/v1/corporate/receive                      → Flutter (GRAuth)  [approve_id ile]
 GET   /api/v1/admin/corporate/applications           → Admin JWT
 PATCH /api/v1/admin/corporate/applications/{id}      → Admin JWT
 GET   /api/v1/admin/corporate/applications/{id}/doc/{doc_type} → Admin JWT (streaming)
@@ -18,14 +20,24 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Cookie, Depends, File, Form, Header, HTTPException, UploadFile, status
+import base64
+
+from fastapi import APIRouter, Cookie, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.mrtd import (
+    MrzParseError,
+    build_mrz_data_from_fields,
+    derive_bac_keys,
+    parse_mrz,
+)
 from app.db.dependencies import get_db
+from app.models.mrtd_session import MrtdPurpose, MrtdSession, MrtdStatus
+from app.repositories.mrtd_session_repo import MrtdSessionRepo, SESSION_TTL_MINUTES
 from app.api.dependencies import get_current_user, get_current_user_optional, UserDTO
 from app.schemas.corporate_application import (
     CorporateApplicationCreate,
@@ -187,6 +199,292 @@ async def submit_web_corporate_application(
     return await web_svc.submit_web_application(session=db, payload=body)
 
 
+# ─── MRTD Oturum doğrulama yardımcısı (server-side authoritative) ─────────
+
+async def _validate_mrtd_session(
+    *,
+    db: AsyncSession,
+    approve_id: Optional[uuid.UUID],
+    mrz_verified: bool,
+    nfc_verified: bool,
+    user_id: uuid.UUID,
+    purpose: "MrtdPurpose",
+) -> Optional["MrtdSession"]:
+    """
+    Flutter tarafından gönderilen mrz_verified / nfc_verified flag'lerine
+    GÜVENMEYİZ — OWASP A01 (Broken Access Control). Her TRUE flag, DB'deki
+    gerçek MRTD oturum durumu ile eşleşmek ZORUNDAdır.
+
+    Koşullar:
+      - Herhangi biri true ise approve_id zorunludur.
+      - Oturum aynı kullanıcıya ait olmalı (IDOR koruması).
+      - purpose eşleşmeli (payment/receive ayrımı).
+      - expires_at geçmemiş, status=NFC_DONE (tüketilmemiş) olmalı.
+    """
+    if not mrz_verified and not nfc_verified and approve_id is None:
+        return None  # MRZ/NFC talep edilmedi, session'a gerek yok
+
+    if approve_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="mrz_verified veya nfc_verified=true ise approve_id zorunludur.",
+        )
+
+    repo = MrtdSessionRepo(db)
+    sess = await repo.get_owned(approve_id, user_id)
+    if sess is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Geçerli MRTD oturumu bulunamadı.",
+        )
+    if sess.purpose != purpose.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Oturum bu işlem türü için oluşturulmamış.",
+        )
+    if sess.is_expired or sess.status in (
+        MrtdStatus.EXPIRED,
+        MrtdStatus.CONSUMED,
+        MrtdStatus.FAILED,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=f"MRTD oturumu geçerli değil (status={sess.status}).",
+        )
+    # nfc_verified=True ise NFC_DONE zorunlu; yalnızca mrz_verified ise MRZ_DONE yeter
+    if nfc_verified and sess.status != MrtdStatus.NFC_DONE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="NFC doğrulaması tamamlanmamış — önce DG verisini yükleyin.",
+        )
+    if mrz_verified and sess.status not in (MrtdStatus.MRZ_DONE, MrtdStatus.NFC_DONE):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="MRZ doğrulaması tamamlanmamış.",
+        )
+    return sess
+
+
+# ─── Flutter: MRTD Oturumu (MRZ + NFC şifreli saklanır, BAC anahtarları
+#             türetilir ve istemciye döner) ───────────────────────────────────
+
+class MrtdSessionRequest(BaseModel):
+    """
+    Flutter MRZ tarandıktan sonra bunu gönderir:
+      - ham MRZ satırları (mrz_raw) VEYA
+      - 3 zorunlu alan: document_number + date_of_birth (YYMMDD) + date_of_expiry (YYMMDD)
+
+    Ham MRZ gönderilirse check digit doğrulaması yapılır (OWASP A03 girdi
+    güvenliği). Aksi takdirde alan-bazlı doğrulama yapılır.
+    """
+    purpose: str = Field(..., pattern=r"^(corporate_payment|corporate_receive)$")
+    mrz_raw: Optional[str] = Field(None, max_length=256)
+    document_number: Optional[str] = Field(None, min_length=5, max_length=30)
+    date_of_birth: Optional[str] = Field(None, pattern=r"^\d{6}$")
+    date_of_expiry: Optional[str] = Field(None, pattern=r"^\d{6}$")
+    doc_type: Optional[str] = Field(None, pattern=r"^(TD1|TD3)$")
+    tckn: Optional[str] = Field(None, min_length=11, max_length=11)
+
+
+class MrtdNfcUploadRequest(BaseModel):
+    """NFC okunduktan sonra DG dosyaları base64 ile iletilir."""
+    dg1_b64: Optional[str] = Field(None, max_length=4096)
+    # DG2 yüz fotoğrafı JPEG/JP2 olabilir — 24 KB tipik sınır ama tolerans için geniş
+    dg2_b64: Optional[str] = Field(None, max_length=524288)
+    dg11_b64: Optional[str] = Field(None, max_length=8192)
+    sod_b64: Optional[str] = Field(None, max_length=16384)
+    passive_auth_ok: bool = False
+
+    @field_validator("dg1_b64", "dg2_b64", "dg11_b64", "sod_b64")
+    @classmethod
+    def _valid_b64(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        try:
+            base64.b64decode(v, validate=True)
+        except Exception as exc:
+            raise ValueError(f"geçersiz base64: {exc}") from exc
+        return v
+
+
+def _decode_b64_opt(s: Optional[str]) -> Optional[bytes]:
+    if not s:
+        return None
+    return base64.b64decode(s, validate=True)
+
+
+@flutter_router.post(
+    "/mrtd/session",
+    status_code=status.HTTP_201_CREATED,
+    summary="MRZ verisi ile MRTD oturumu başlat",
+    description=(
+        "MRZ'den BAC KEnc/KMac anahtarları türetir ve istemciye döner. "
+        "MRZ ham verisi AES-256-GCM ile şifreli saklanır; 15 dk TTL. "
+        "Bu endpoint'ten dönen approve_id kurumsal ödeme/alma talebinde zorunludur."
+    ),
+)
+async def create_mrtd_session(
+    body: MrtdSessionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserDTO = Depends(get_current_user),
+) -> dict:
+    # Onaylanmış kurumsal başvuru şartı — kimlik okuma ayrıcalıklı işlem
+    app_repo = CorporateApplicationRepo(db)
+    corp_app = await app_repo.get_latest_by_user_id(current_user.id)
+    if not corp_app or corp_app.status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Kimlik okuma onaylanmış kurumsal hesap gerektirir.",
+        )
+
+    # MRZ ayrıştırma / doğrulama
+    try:
+        if body.mrz_raw:
+            mrz = parse_mrz(body.mrz_raw)
+        elif body.document_number and body.date_of_birth and body.date_of_expiry:
+            mrz = build_mrz_data_from_fields(
+                document_number=body.document_number,
+                date_of_birth=body.date_of_birth,
+                date_of_expiry=body.date_of_expiry,
+                doc_type=body.doc_type or "TD1",
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="mrz_raw veya (document_number + date_of_birth + date_of_expiry) zorunludur.",
+            )
+    except MrzParseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"MRZ doğrulanamadı: {exc}",
+        ) from exc
+
+    # BAC anahtarları — ICAO 9303 App D.1 (SAKLANMAZ)
+    bac = derive_bac_keys(mrz)
+
+    # Oturumu oluştur (MRZ şifreli)
+    repo = MrtdSessionRepo(db)
+    sess = await repo.create_from_mrz(
+        user_id=current_user.id,
+        purpose=(
+            MrtdPurpose.CORPORATE_PAYMENT
+            if body.purpose == "corporate_payment"
+            else MrtdPurpose.CORPORATE_RECEIVE
+        ),
+        mrz=mrz,
+        tckn=body.tckn,
+        client_ip=(request.client.host if request.client else None),
+        user_agent=request.headers.get("user-agent", "")[:200],
+    )
+    await db.commit()
+
+    logger.info(
+        "mrtd.session.created",
+        approve_id=str(sess.id),
+        user_id=str(current_user.id),
+        purpose=body.purpose,
+        doc_type=mrz.doc_type,
+    )
+
+    return {
+        "approve_id": str(sess.id),
+        "status": sess.status,
+        "expires_at": sess.expires_at.isoformat(),
+        "ttl_minutes": SESSION_TTL_MINUTES,
+        "doc_type": mrz.doc_type,
+        "issuing_state": mrz.issuing_state,
+        "date_of_expiry": mrz.date_of_expiry,
+        "bac": bac.to_dict(),
+    }
+
+
+@flutter_router.post(
+    "/mrtd/session/{approve_id}/nfc",
+    summary="NFC okuma verilerini (DG1/DG2/DG11/SOD) yükle",
+    description=(
+        "İstemci BAC/PACE ile çipi unlock ettikten sonra okunan EF dosyalarını "
+        "gönderir. Tümü AES-256-GCM ile şifreli saklanır. Başarısız denemeler "
+        "attempts sayacını artırır; 5. denemede oturum FAILED olur."
+    ),
+)
+async def upload_mrtd_nfc(
+    approve_id: uuid.UUID,
+    body: MrtdNfcUploadRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserDTO = Depends(get_current_user),
+) -> dict:
+    repo = MrtdSessionRepo(db)
+    sess = await repo.get_owned(approve_id, current_user.id)
+
+    if not sess:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Oturum bulunamadı."
+        )
+    if sess.is_expired:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Oturum süresi doldu. Kimliği tekrar okutun.",
+        )
+    if sess.status in (MrtdStatus.CONSUMED, MrtdStatus.EXPIRED):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Oturum bu aşamada güncellenemez (status={sess.status}).",
+        )
+
+    try:
+        dg1 = _decode_b64_opt(body.dg1_b64)
+        dg2 = _decode_b64_opt(body.dg2_b64)
+        dg11 = _decode_b64_opt(body.dg11_b64)
+        sod = _decode_b64_opt(body.sod_b64)
+    except Exception as exc:
+        await repo.record_attempt_failure(sess, error=f"b64_decode: {exc}")
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Geçersiz NFC veri kodlaması."
+        ) from exc
+
+    if not any([dg1, dg2, dg11, sod]):
+        await repo.record_attempt_failure(sess, error="no_dg_payload")
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="En az bir DG dosyası gönderilmelidir.",
+        )
+
+    try:
+        await repo.set_nfc_payload(
+            sess,
+            dg1=dg1, dg2=dg2, dg11=dg11, sod=sod,
+            passive_auth_ok=body.passive_auth_ok,
+        )
+        await db.commit()
+    except Exception as exc:
+        await repo.record_attempt_failure(sess, error=f"enc_failed: {type(exc).__name__}")
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="NFC verisi şifrelenemedi.",
+        ) from exc
+
+    logger.info(
+        "mrtd.session.nfc_uploaded",
+        approve_id=str(sess.id),
+        user_id=str(current_user.id),
+        has_dg1=dg1 is not None, has_dg2=dg2 is not None,
+        has_dg11=dg11 is not None, has_sod=sod is not None,
+        passive_auth_ok=body.passive_auth_ok,
+    )
+
+    return {
+        "approve_id": str(sess.id),
+        "status": sess.status,
+        "nfc_verified": True,
+        "passive_auth_ok": sess.passive_auth_ok,
+        "expires_at": sess.expires_at.isoformat(),
+    }
+
+
 # ─── Flutter: Kurumsal Ödeme ─────────────────────────────────────────────────
 
 class CorporatePaymentRequest(BaseModel):
@@ -198,6 +496,10 @@ class CorporatePaymentRequest(BaseModel):
     gold_type:       str      = Field(..., min_length=2, max_length=100, description="Ör: Cumhuriyet Altını")
     mrz_verified:    bool     = False
     nfc_verified:    bool     = False
+    approve_id:      Optional[uuid.UUID] = Field(
+        None,
+        description="MRTD oturum kimliği — mrz_verified/nfc_verified TRUE ise zorunlu",
+    )
 
 
 class OtpVerifyRequest(BaseModel):
@@ -224,16 +526,17 @@ async def create_corporate_payment(
             detail="Bu işlemi gerçekleştirmek için onaylanmış bir kurumsal hesabınız bulunmamaktadır.",
         )
 
-    # M-2: nfc_verified ve mrz_verified server-side cross-check
-    # Flutter'dan gelen değer; DB'deki gerçek kullanıcı durumu ile çapraz kontrol edilir.
-    if body.nfc_verified and not current_user.nfc_verified:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "nfc_verified=true talep edildi ancak bu hesapta NFC doğrulaması "
-                "kayıtlı değil. Lütfen uygulamayı güncelleyin."
-            ),
-        )
+    # MRTD oturumu server-side doğrulaması (M-2 + OWASP A01)
+    # Flutter'dan gelen flag'lere GÜVENMEYİZ; approve_id üzerinden DB'deki
+    # gerçek oturum durumu kontrol edilir.
+    mrtd_sess = await _validate_mrtd_session(
+        db=db,
+        approve_id=body.approve_id,
+        mrz_verified=body.mrz_verified,
+        nfc_verified=body.nfc_verified,
+        user_id=current_user.id,
+        purpose=MrtdPurpose.CORPORATE_PAYMENT,
+    )
 
     # 6 haneli OTP üret
     otp_plain = f"{random.randint(0, 999999):06d}"
@@ -251,6 +554,10 @@ async def create_corporate_payment(
         mrz_verified=body.mrz_verified,
         nfc_verified=body.nfc_verified,
     )
+    if mrtd_sess is not None:
+        payment.mrtd_session_id = mrtd_sess.id
+        mrtd_repo = MrtdSessionRepo(db)
+        await mrtd_repo.consume(mrtd_sess, payment_id=payment.id)
     await db.commit()
 
     # Netgsm ile SMS gönder (hata olsa işlem durdurmaz)
@@ -452,6 +759,10 @@ class CorporateReceiveRequest(BaseModel):
     gold_type:       str    = Field(..., min_length=1, max_length=100)
     mrz_verified:    bool   = False
     nfc_verified:    bool   = False
+    approve_id:      Optional[uuid.UUID] = Field(
+        None,
+        description="MRTD oturum kimliği — mrz_verified/nfc_verified TRUE ise zorunlu",
+    )
 
 
 @flutter_router.post(
@@ -479,6 +790,16 @@ async def create_corporate_receive(
             detail="Bu işlem için onaylı kurumsal hesap gereklidir.",
         )
 
+    # MRTD oturumu server-side doğrulaması
+    mrtd_sess = await _validate_mrtd_session(
+        db=db,
+        approve_id=body.approve_id,
+        mrz_verified=body.mrz_verified,
+        nfc_verified=body.nfc_verified,
+        user_id=current_user.id,
+        purpose=MrtdPurpose.CORPORATE_RECEIVE,
+    )
+
     receive_repo = CorporateReceiveRepo(db)
     req = await receive_repo.create(
         seller_user_id=current_user.id,
@@ -490,6 +811,10 @@ async def create_corporate_receive(
         mrz_verified=body.mrz_verified,
         nfc_verified=body.nfc_verified,
     )
+    if mrtd_sess is not None:
+        req.mrtd_session_id = mrtd_sess.id
+        mrtd_repo = MrtdSessionRepo(db)
+        await mrtd_repo.consume(mrtd_sess, receive_id=req.id)
     await db.commit()
 
     # Tutarı Türkçe formatlı gönder  (1234.50 → "1.234,50")

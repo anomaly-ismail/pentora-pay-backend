@@ -99,6 +99,14 @@ class CorporateReceiveRequest(Base):
         Boolean, default=False, server_default=text("false")
     )
 
+    # MRTD oturum bağlantısı (şifreli MRZ + DG dosyaları burada tutulur)
+    mrtd_session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+        comment="mrtd_sessions.id — approve_id ile audit zinciri",
+    )
+
     # SMS gönderildi mi?
     sms_sent: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false")
