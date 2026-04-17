@@ -97,9 +97,106 @@ async def run_migrations() -> None:
     logger.info("db.migrations.applied")
 
 
-async def create_all_tables() -> None:
-    """Geliştirme için tüm tabloları oluşturur. Üretimde Alembic kullanın."""
+def _reconcile_schema_sync(sync_conn) -> None:
+    """
+    Self-healing şema uyumlayıcısı.
+
+    SQLAlchemy model metadata'sını canlı DB şemasıyla karşılaştırır; eksik
+    kolonları `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` ile, eksik indeksleri
+    `CREATE INDEX IF NOT EXISTS` ile otomatik ekler.
+
+    Idempotent ve üretim-güvenli:
+      • Mevcut veriye dokunmaz — yalnızca eksik olanları ekler.
+      • Kolon tipleri, NULL/NOT NULL ve server_default PostgreSQL dialect'i ile
+        SQLAlchemy DDL compiler'ından üretilir (manuel string hatası riski yok).
+      • `NOT NULL` + `server_default` yoksa kolon güvenli şekilde nullable eklenir
+        (mevcut satırlarda veri yok → NOT NULL constraint violation önlenir).
+      • Foreign key / enum değişiklikleri bu reconciler'ın kapsamında değildir;
+        o tür migration'lar için Alembic kullanılır.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
     from app.db.base import Base
+
+    inspector = sa_inspect(sync_conn)
+    dialect = sync_conn.dialect
+    ddl_compiler = dialect.ddl_compiler(dialect, None)
+
+    for table in Base.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            # create_all çağrıldıktan sonra tablo hâlâ yoksa, bir FK sorunu
+            # vardır — bunu susmadan logla ve bu tabloyu atla.
+            logger.warning("db.schema.reconcile.table_missing", table=table.name)
+            continue
+
+        # ── Eksik kolonlar ─────────────────────────────────────────────────
+        existing_cols = {c["name"] for c in inspector.get_columns(table.name)}
+        for col in table.columns:
+            if col.name in existing_cols:
+                continue
+
+            col_spec = ddl_compiler.get_column_specification(col)
+            needs_null_fallback = (
+                not col.nullable and col.server_default is None
+            )
+
+            if needs_null_fallback:
+                # NOT NULL + default yoksa mevcut satırları bozmadan
+                # güvenli bir şekilde NULL kolon olarak ekle.
+                safe_spec = col_spec.replace(" NOT NULL", "")
+                sync_conn.exec_driver_sql(
+                    f'ALTER TABLE "{table.name}" '
+                    f'ADD COLUMN IF NOT EXISTS {safe_spec}'
+                )
+                logger.warning(
+                    "db.schema.column_added_nullable",
+                    table=table.name,
+                    column=col.name,
+                    hint=(
+                        "NOT NULL + default olmadan kolon eklendi; "
+                        "mevcut satırlar için backfill gerekebilir."
+                    ),
+                )
+            else:
+                sync_conn.exec_driver_sql(
+                    f'ALTER TABLE "{table.name}" '
+                    f'ADD COLUMN IF NOT EXISTS {col_spec}'
+                )
+                logger.info(
+                    "db.schema.column_added",
+                    table=table.name,
+                    column=col.name,
+                )
+
+        # ── Eksik indeksler ────────────────────────────────────────────────
+        existing_idx = {i["name"] for i in inspector.get_indexes(table.name)}
+        for index in table.indexes:
+            if not index.name or index.name in existing_idx:
+                continue
+            cols_sql = ", ".join(f'"{c.name}"' for c in index.columns)
+            unique_sql = "UNIQUE " if index.unique else ""
+            sync_conn.exec_driver_sql(
+                f'CREATE {unique_sql}INDEX IF NOT EXISTS "{index.name}" '
+                f'ON "{table.name}" ({cols_sql})'
+            )
+            logger.info(
+                "db.schema.index_added",
+                table=table.name,
+                index=index.name,
+            )
+
+
+async def create_all_tables() -> None:
+    """
+    Tüm ortamlarda çalışan idempotent şema bootstrap'i:
+      1. `CREATE TABLE IF NOT EXISTS` — eksik tablolar
+      2. Self-healing reconciler — eksik kolonlar + indeksler
+      3. Geriye dönük manuel SQL fix'leri (applicant_tckn tip yükseltme vb.)
+
+    Mevcut veriye ve yapılara dokunmaz. Üretimde ayrıca Alembic migration'ları
+    çalıştırmanız önerilir (FK, enum, constraint değişiklikleri için).
+    """
+    from app.db.base import Base  # noqa: F401 — metadata.create_all için
     # Modelleri import et (Base.metadata'ya kayıt olsunlar)
     import app.models.user          # noqa: F401
     import app.models.user_session  # noqa: F401
@@ -113,14 +210,19 @@ async def create_all_tables() -> None:
     import app.models.mrtd_session  # noqa: F401
 
     async with get_engine().begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Geriye dönük uyumluluk: mevcut tabloda yeni kolonlar eksikse ekle
-        # L-5: applicant_tckn artık HMAC-SHA3-512 hash saklar (128 hex karakter)
+        # 1) Eksik tabloları oluştur (create_all zaten IF NOT EXISTS kullanır)
+        from app.db.base import Base as _Base
+        await conn.run_sync(_Base.metadata.create_all)
+
+        # 2) Self-healing: eksik kolon ve indeksleri otomatik ekle
+        await conn.run_sync(_reconcile_schema_sync)
+
+        # 3) Eski özel migration'lar — kolon tip yükseltmeleri vb.
+        # L-5: applicant_tckn artık HMAC-SHA3-512 hash saklar (128 hex)
         await conn.exec_driver_sql(
             "ALTER TABLE corporate_applications "
             "ADD COLUMN IF NOT EXISTS applicant_tckn VARCHAR(128)"
         )
-        # Mevcut VARCHAR(11) kolonunu VARCHAR(128)'e yükselt (zaten varsa)
         await conn.exec_driver_sql(
             "ALTER TABLE corporate_applications "
             "ALTER COLUMN applicant_tckn TYPE VARCHAR(128)"
