@@ -254,19 +254,30 @@ async def login_admin(request: AdminLoginRequest) -> JSONResponse:
     expires_in = settings.jwt_access_token_expire_minutes * 60
 
     # H-12: Token YALNIZCA HttpOnly cookie'de döner; body içermez.
-    # XSS olsa dahi document.cookie ile erişilemez; CSRF için SameSite=strict.
+    # XSS olsa dahi document.cookie ile erişilemez.
+    # Cookie domain/SameSite stratejisi:
+    #   • Frontend (pay.pentorasec.com.tr) ile API (api.pentorasec.com.tr)
+    #     farklı subdomain'lerde çalışıyor. SameSite=Strict bazı tarayıcılarda
+    #     subdomain redirect sonrası cookie'yi göndermiyor → 401 döngüsü.
+    #   • Çözüm: Domain=.pentorasec.com.tr (eTLD+1) + SameSite=Lax.
+    #   • CSRF koruması: cookie path=/api/v1/admin (yalnız admin API'sine gider)
+    #     + Lax (cross-site POST/PUT/DELETE'te gönderilmez) + admin endpoint'leri
+    #     ek Origin/CSRF kontrolü uyguluyor.
     response = JSONResponse(
         content=AdminLoginResponse(expires_in=expires_in).model_dump()
     )
-    response.set_cookie(
-        key="admin_token",
-        value=access_token,
-        httponly=True,
-        secure=settings.is_production,   # Üretimde sadece HTTPS
-        samesite="strict",
-        max_age=expires_in,
-        path="/api/v1/admin",
-    )
+    cookie_kwargs: dict = {
+        "key": "admin_token",
+        "value": access_token,
+        "httponly": True,
+        "secure": settings.is_production,
+        "samesite": "lax",
+        "max_age": expires_in,
+        "path": "/api/v1/admin",
+    }
+    if settings.is_production:
+        cookie_kwargs["domain"] = ".pentorasec.com.tr"
+    response.set_cookie(**cookie_kwargs)
     return response
 
 

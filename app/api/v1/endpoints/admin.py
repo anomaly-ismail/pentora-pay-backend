@@ -47,11 +47,14 @@ async def admin_logout(
     from app.core.config import get_settings
     settings = get_settings()
     response = JSONResponse(content=result)
-    response.delete_cookie(
-        key="admin_token",
-        path="/api/v1/admin",
-        secure=settings.is_production,
-        httponly=True,
-        samesite="strict",
-    )
+    delete_kwargs: dict = {
+        "key": "admin_token",
+        "path": "/api/v1/admin",
+        "secure": settings.is_production,
+        "httponly": True,
+        "samesite": "lax",
+    }
+    if settings.is_production:
+        delete_kwargs["domain"] = ".pentorasec.com.tr"
+    response.delete_cookie(**delete_kwargs)
     return response
