@@ -250,31 +250,48 @@ def compute_request_sig(
     body: bytes | None = None,
 ) -> str:
     """
-    HMAC-SHA256(f"{handshake_id}:{timestamp}:{path}:{nonce}:{body_sha256}", session_key) → hex
+    İki imza şeması:
 
-    M-16: nonce + body hash imzaya dahil edilir.
-      • nonce: Client tarafından her istekte yeni üretilir (replay koruma).
+    M-16 (strict — yeni istemci):
+        HMAC-SHA256(f"{handshake_id}:{timestamp}:{path}:{nonce}:{body_sha256}",
+                    session_key) → hex
+      • nonce: Her istekte yeni üretilen rastgele değer (replay koruma).
       • body : POST/PUT body'sinin SHA-256 hash'i hex (tampering koruma).
         Body yoksa boş string ("").
 
-    Geriye dönük uyumluluk:
-      • Eski istemciler nonce/body göndermez → ikisi de "" → eski hash sonucu
-        elde edilir, üretim açısından kırıcı değildir; ancak yeni istemciler
-        zorunlu olarak nonce + body_sha256 ile imzalar.
+    Legacy (eski istemci — nonce header'ı göndermez):
+        HMAC-SHA256(f"{handshake_id}:{timestamp}:{path}", session_key) → hex
 
-    Flutter tarafı aynı fonksiyonu uygulamalıdır:
+    Hangi şemayı kullanacağımıza CALLER karar verir:
+      • `nonce == ""` ve `body is None` → Legacy. Eski Flutter sürümleriyle
+        bire bir aynı string'i üretir (hash sonunda `::` YOKTUR).
+      • Aksi halde → Strict.
+
+    Flutter karşılığı:
     ```dart
-    final bodyHash = body == null ? '' : sha256.convert(body).toString();
-    final msg = '$handshakeId:$timestamp:$path:$nonce:$bodyHash';
+    if (strict) {
+      final bodyHash = body == null ? '' : sha256.convert(body).toString();
+      final msg = '$handshakeId:$timestamp:$path:$nonce:$bodyHash';
+    } else {
+      final msg = '$handshakeId:$timestamp:$path';
+    }
     final sig = Hmac(sha256, sessionKey).convert(utf8.encode(msg)).toString();
     ```
     """
     import hmac as stdlib_hmac
-    if body is None or len(body) == 0:
-        body_sha = ""
+
+    use_strict = bool(nonce) or body is not None
+
+    if use_strict:
+        if body is None or len(body) == 0:
+            body_sha = ""
+        else:
+            body_sha = hashlib.sha256(body).hexdigest()
+        message = f"{handshake_id}:{timestamp}:{path}:{nonce}:{body_sha}".encode("utf-8")
     else:
-        body_sha = hashlib.sha256(body).hexdigest()
-    message = f"{handshake_id}:{timestamp}:{path}:{nonce}:{body_sha}".encode("utf-8")
+        # Legacy — Flutter'ın `_signRequest(path)` (body yok) çağrısıyla eşit.
+        message = f"{handshake_id}:{timestamp}:{path}".encode("utf-8")
+
     return stdlib_hmac.new(session_key, message, hashlib.sha256).hexdigest()
 
 
