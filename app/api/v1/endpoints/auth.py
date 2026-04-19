@@ -5,6 +5,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import update
 
+from app.core.client_ip import get_real_client_ip
 from app.core.handshake import HandshakeError, perform_handshake
 from app.core.logging import get_logger
 from app.core.config import get_settings
@@ -33,16 +34,18 @@ _bearer = HTTPBearer()
     summary="ECDH Key Exchange — Dinamik Session Key",
     description=(
         "Flutter uygulaması her oturum başında bu endpoint'i çağırarak "
-        "ephemeral ECDH P-256 anahtar değişimi yapar. "
+        "ephemeral ECDH **X25519** anahtar değişimi yapar. "
         "Dönen server_public_key ile session_key türetilir (sadece RAM'de). "
         "Bu endpoint ClientAuthMiddleware bypass'ındadır."
     ),
 )
 async def handshake(body: HandshakeRequest, request: Request) -> HandshakeResponse:
     """
-    ECDH P-256 handshake — sunucu ephemeral keypair üretir,
+    ECDH **X25519** handshake — sunucu ephemeral keypair üretir,
     shared secret'tan HKDF-SHA256 ile session_key türetir.
     Session key RAM'de TTL ile saklanır.
+    L-2: Eski sürümlerdeki "P-256" ifadesi yanlıştı; gerçek implementasyon
+    X25519 (RFC 7748) — `app/core/handshake.py`.
     """
     # Bundle ID doğrulama (middleware bypass'ında olduğu için manuel kontrol)
     bundle_id = request.headers.get("X-Pentora-Bundle-ID", "")
@@ -90,13 +93,11 @@ async def register(
       TCKN checksum (sunucu) → çakışma kontrolü (hash) → GRAuth token üretimi
       → DB kayıt (sıfır plaintext PII) → denetim logu → token dön
     """
-    client_ip = (
-        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        or (request.client.host if request.client else "unknown")
-    )
+    # H-3: trusted reverse proxy üzerinden geldiyse XFF kullan; aksi halde peer IP.
+    client_ip = get_real_client_ip(request)
     user_agent = request.headers.get("user-agent", "")[:200]
 
-    grauth_result = await register_user(
+    grauth_result, effective_nfc_verified = await register_user(
         request=body,
         db=db,
         client_ip=client_ip,
@@ -108,7 +109,8 @@ async def register(
         grauth_token=grauth_result.token,
         session_id=grauth_result.session_id,
         expires_in=grauth_result.expires_at - grauth_result.issued_at,
-        nfc_verified=body.nfc_verified,
+        # M-1: İstemcinin gönderdiği değil, sunucunun yeniden değerlendirdiği bayrak.
+        nfc_verified=effective_nfc_verified,
     )
 
 
@@ -128,13 +130,11 @@ async def login(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> LoginResponse:
-    client_ip = (
-        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        or (request.client.host if request.client else "unknown")
-    )
+    # H-3: trusted reverse proxy üzerinden geldiyse XFF kullan; aksi halde peer IP.
+    client_ip = get_real_client_ip(request)
     user_agent = request.headers.get("user-agent", "")[:200]
 
-    grauth_result = await login_user(
+    grauth_result, user = await login_user(
         request=body,
         db=db,
         client_ip=client_ip,
@@ -146,7 +146,10 @@ async def login(
         grauth_token=grauth_result.token,
         session_id=grauth_result.session_id,
         expires_in=grauth_result.expires_at - grauth_result.issued_at,
-        nfc_verified=True, # Backend login başarılıysa hesap her zaman NFC verified'dır
+        # M-1: User tablosundaki gerçek bayrak. Hesap NFC ile kayıt olmuşsa True,
+        # değilse False; istemci tarafı bu bayrağa göre "NFC ile yükselt" akışına
+        # yönlendirir.
+        nfc_verified=bool(user.nfc_verified),
     )
 
 

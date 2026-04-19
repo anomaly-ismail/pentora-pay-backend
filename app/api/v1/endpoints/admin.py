@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from app.schemas.admin import AdminLoginRequest, AdminLoginResponse, AdminLogoutResponse
-from app.services.admin_service import login_admin, logout_admin, verify_admin_token
+from app.services.admin_service import login_admin, logout_admin
 
 router = APIRouter(prefix="/admin/sso", tags=["Admin SSO"])
 

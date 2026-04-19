@@ -12,6 +12,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp
 
+from app.core.client_ip import get_real_client_ip
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -113,16 +114,11 @@ def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
 
 def _get_client_ip(request: Request) -> str:
     """
-    Gerçek istemci IP'sini alır.
-    Reverse proxy arkasında X-Forwarded-For kullanılır (güvenilir proxy için).
+    H-3: Gerçek istemci IP'sini alır.
+
+    Eski sürüm `X-Forwarded-For`'u herkesin spoof edebileceği bir header
+    olarak kabul ediyordu — bu da log korelasyonunu, rate limit'i ve fraud
+    sinyallerini bozuyordu. Yeni mantık `trusted_proxy_ips` ayarlı reverse
+    proxy'lerden gelen XFF'i kabul eder; aksi halde TCP peer IP'sini döndürür.
     """
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        # İlk IP gerçek istemcidir (son proxy zinciri olmadığı varsayılır)
-        return forwarded_for.split(",")[0].strip()
-    real_ip = request.headers.get("X-Real-IP")
-    if real_ip:
-        return real_ip.strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
+    return get_real_client_ip(request)

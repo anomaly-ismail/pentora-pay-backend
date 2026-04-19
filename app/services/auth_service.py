@@ -5,6 +5,7 @@ Repository katmanını kullanır, HTTP'den izoledir.
 from __future__ import annotations
 
 import asyncio
+import re
 import secrets
 from datetime import datetime, timezone
 
@@ -14,8 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.gr_auth import GRAuthToken, generate_grauth_token
 from app.core.logging import get_logger
 from app.models.audit_event import AuditEventType
+from app.models.user import User
 from app.repositories.user_repo import UserRepository
-from app.schemas.auth import RegisterRequest
+from app.schemas.auth import LoginRequest, RegisterRequest
+
+# Hex UID için minimum uzunluk: gerçek ICAO MRTD chip UID'leri 4–10 byte
+# (8–20 hex). Bunun altında bir UID kabul edilmez — magic string / placeholder
+# atlatması önlenir.
+_NFC_UID_HEX_PATTERN = re.compile(r"^[0-9A-Fa-f]{8,32}$")
 
 logger = get_logger(__name__)
 
@@ -79,10 +86,42 @@ async def register_user(
             },
         )
 
-    # ── 1.5 Doğrulama Kontrolü ──────────────────────────────────────
-    if request.nfc_verified and request.nfc_uid_hex == "MRTD_BAC_VERIFIED_TCKN":
-        # TCKN NFC'den cihaz tarafında (dmrtd) okunmuş ve harfi harfine eşleştirilmiştir.
-        pass
+    # ── 1.5 NFC doğrulama bayrağını sunucu tarafında yeniden değerlendir ────
+    # GÜVENLİK (C-1 / OWASP A07): İstemcinin gönderdiği `nfc_verified` ve
+    # `nfc_uid_hex` boolean'ına asla doğrudan güvenilmez. Magic-string
+    # atlatması (ör. "MRTD_BAC_VERIFIED_TCKN") veya kısa/placeholder UID'ler
+    # sunucu seviyesinde reddedilir; aksi takdirde kayıt sırasında çok
+    # faktörlü kimlik doğrulama bypass edilebilir.
+    effective_nfc_verified = (
+        bool(request.nfc_verified)
+        and bool(request.nfc_uid_hex)
+        and _NFC_UID_HEX_PATTERN.match(request.nfc_uid_hex) is not None
+    )
+
+    if request.nfc_verified and not effective_nfc_verified:
+        # İstemci `nfc_verified=True` iddia etti ama UID geçersiz / placeholder.
+        # Sahtecilik şüphesi: denetim logu yaz, isteği reddet.
+        logger.warning(
+            "auth.register.nfc_verified_claim_invalid",
+            tckn_prefix=request.tckn[:3] + "********",
+            uid_len=len(request.nfc_uid_hex or ""),
+        )
+        await repo.log_event(
+            AuditEventType.REGISTER_FAILED,
+            client_ip=client_ip,
+            user_agent=user_agent,
+            details={"reason": "nfc_verified_claim_with_invalid_uid"},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "invalid_nfc_attestation",
+                "message": (
+                    "NFC doğrulama iddiası geçersiz. Lütfen kimlik kartınızı "
+                    "yeniden okutun."
+                ),
+            },
+        )
 
     # ── 2. GRAuth Argon2id Salt Üretimi ──────────────────────────────────────
     grauth_salt = secrets.token_bytes(32)
@@ -105,12 +144,14 @@ async def register_user(
         )
 
     # ── 4. Kullanıcı Oluşturma ───────────────────────────────────────────────
+    # NOT: `nfc_verified` istemciden değil, sunucunun yeniden değerlendirdiği
+    # `effective_nfc_verified` bayrağından alınır.
     user = await repo.create_user(
         tckn=request.tckn,
         pin=request.pin,
         nfc_uid_hex=request.nfc_uid_hex,
         grauth_salt=grauth_salt,
-        nfc_verified=request.nfc_verified,
+        nfc_verified=effective_nfc_verified,
     )
 
     # ── 4.5. Kullanıcı Cüzdanını (Liability Account) Oluşturma ───────────────
@@ -146,7 +187,7 @@ async def register_user(
         client_ip=client_ip,
         user_agent=user_agent,
         details={
-            "nfc_verified": request.nfc_verified,
+            "nfc_verified": effective_nfc_verified,
             "session_id": grauth_result.session_id,
         },
     )
@@ -154,11 +195,13 @@ async def register_user(
     logger.info(
         "auth.register.success",
         user_id=str(user.id),
-        nfc_verified=request.nfc_verified,
+        nfc_verified=effective_nfc_verified,
         session_id=grauth_result.session_id,
     )
 
-    return grauth_result
+    # M-1: Endpoint, sunucu tarafında değerlendirilmiş gerçek bayrağı yansıtır.
+    # GRAuthToken'a ek olarak effective flag'i taşıyabilmek için tuple döner.
+    return grauth_result, effective_nfc_verified
 
 
 async def login_user(
@@ -166,7 +209,7 @@ async def login_user(
     db: AsyncSession,
     client_ip: str,
     user_agent: str,
-) -> GRAuthToken:
+) -> tuple[GRAuthToken, User]:
     """
     Kullanıcı giriş (Login) iş mantığı.
 
@@ -258,8 +301,7 @@ async def login_user(
         session_id=grauth_result.session_id,
     )
 
-    # register dönerken nfc_verified da alıyorduk, onu set edelim
-    # model.user'den getattr kullanıyoruz:
-    # grauth_result return ediyoruz ama endpoint tarafta nfc_verified eklenecek
-    return grauth_result
+    # M-1: Endpoint katmanı `user.nfc_verified` gerçek değerini cevaba koyabilsin
+    # diye user nesnesini de geri döneriz.
+    return grauth_result, user
 

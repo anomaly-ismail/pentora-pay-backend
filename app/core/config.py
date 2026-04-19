@@ -129,6 +129,12 @@ class Settings(BaseSettings):
     # PayTR ödeme linki tabanı — {id} payment_id ile tamamlanır
     payment_portal_url: str = "https://pentorasec.online/pay"
 
+    # M-21: Payment portal POST uçları için CSRF Origin allowlist.
+    # Virgülle ayrılmış scheme://host[:port] listesi. Bu listede yer almayan
+    # bir Origin/Referer header'ı 403 ile reddedilir. Boşsa CORS allowlist
+    # ile aynı kullanılır.
+    csrf_allowed_origins: str = ""
+
     # ── Validators ──────────────────────────────────────────────────────────────
 
     @field_validator("pentora_signature_secret", "pentora_grauth_secret", "tckn_pepper")
@@ -176,6 +182,15 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
+
+    @property
+    def csrf_allowed_origins_list(self) -> list[str]:
+        """
+        M-21: Payment portal CSRF allowlist. csrf_allowed_origins boşsa CORS
+        allowlist'i fallback olarak kullanılır (single source of truth).
+        """
+        raw = self.csrf_allowed_origins or self.cors_allowed_origins
+        return [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
 
     @property
     def is_production(self) -> bool:

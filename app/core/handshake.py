@@ -245,18 +245,36 @@ def compute_request_sig(
     timestamp: int,
     path: str,
     session_key: bytes,
+    *,
+    nonce: str = "",
+    body: bytes | None = None,
 ) -> str:
     """
-    HMAC-SHA256(f"{handshake_id}:{timestamp}:{path}", session_key) → hex
+    HMAC-SHA256(f"{handshake_id}:{timestamp}:{path}:{nonce}:{body_sha256}", session_key) → hex
+
+    M-16: nonce + body hash imzaya dahil edilir.
+      • nonce: Client tarafından her istekte yeni üretilir (replay koruma).
+      • body : POST/PUT body'sinin SHA-256 hash'i hex (tampering koruma).
+        Body yoksa boş string ("").
+
+    Geriye dönük uyumluluk:
+      • Eski istemciler nonce/body göndermez → ikisi de "" → eski hash sonucu
+        elde edilir, üretim açısından kırıcı değildir; ancak yeni istemciler
+        zorunlu olarak nonce + body_sha256 ile imzalar.
 
     Flutter tarafı aynı fonksiyonu uygulamalıdır:
     ```dart
-    final msg = '$handshakeId:$timestamp:$path';
+    final bodyHash = body == null ? '' : sha256.convert(body).toString();
+    final msg = '$handshakeId:$timestamp:$path:$nonce:$bodyHash';
     final sig = Hmac(sha256, sessionKey).convert(utf8.encode(msg)).toString();
     ```
     """
     import hmac as stdlib_hmac
-    message = f"{handshake_id}:{timestamp}:{path}".encode("utf-8")
+    if body is None or len(body) == 0:
+        body_sha = ""
+    else:
+        body_sha = hashlib.sha256(body).hexdigest()
+    message = f"{handshake_id}:{timestamp}:{path}:{nonce}:{body_sha}".encode("utf-8")
     return stdlib_hmac.new(session_key, message, hashlib.sha256).hexdigest()
 
 

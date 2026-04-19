@@ -27,7 +27,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.client_ip import get_real_client_ip
 from app.core.config import get_settings
+from app.core.masking import mask_tckn  # H-6
 from app.core.logging import get_logger
 from app.core.mrtd import (
     MrzParseError,
@@ -35,9 +37,14 @@ from app.core.mrtd import (
     derive_bac_keys,
     parse_mrz,
 )
+from app.core.mrtd_passive_auth import verify_passive_auth  # H-8
 from app.db.dependencies import get_db
 from app.models.mrtd_session import MrtdPurpose, MrtdSession, MrtdStatus
-from app.repositories.mrtd_session_repo import MrtdSessionRepo, SESSION_TTL_MINUTES
+from app.repositories.mrtd_session_repo import (
+    MrtdSessionConsumeError,
+    MrtdSessionRepo,
+    SESSION_TTL_MINUTES,
+)
 from app.api.dependencies import get_current_user, get_current_user_optional, UserDTO
 from app.schemas.corporate_application import (
     CorporateApplicationCreate,
@@ -94,7 +101,8 @@ async def require_admin_jwt(
             detail="Yetkilendirme token'ı gereklidir",
         )
 
-    return verify_admin_token(token)
+    # H-2: blacklist DB'de — async çağrı zorunlu.
+    return await verify_admin_token(token)
 
 
 # ─── Flutter: Başvuru Gönder ──────────────────────────────────────────────────
@@ -374,7 +382,8 @@ async def create_mrtd_session(
         ),
         mrz=mrz,
         tckn=body.tckn,
-        client_ip=(request.client.host if request.client else None),
+        # H-3: trusted reverse proxy XFF parser
+        client_ip=get_real_client_ip(request),
         user_agent=request.headers.get("user-agent", "")[:200],
     )
     await db.commit()
@@ -452,11 +461,36 @@ async def upload_mrtd_nfc(
             detail="En az bir DG dosyası gönderilmelidir.",
         )
 
+    # ── H-8: Sunucu tarafı Passive Authentication ─────────────────────────
+    # İstemcinin `passive_auth_ok` bayrağı tek başına asla yeterli değildir.
+    # Sunucu, SOD'u yeniden parse edip DG1 (ve mevcutsa DG2/DG11) hash'lerini
+    # bağımsız olarak doğrular. Yalnızca server-side sonuç kararlıdır.
+    pa_result = verify_passive_auth(
+        sod_bytes=sod, dg1_bytes=dg1, dg2_bytes=dg2, dg11_bytes=dg11,
+    )
+    server_passive_auth_ok = pa_result.integrity_ok
+
+    if not server_passive_auth_ok:
+        await repo.record_attempt_failure(
+            sess, error=f"passive_auth_failed:{pa_result.error or 'unknown'}",
+        )
+        await db.commit()
+        logger.warning(
+            "mrtd.passive_auth.failed",
+            approve_id=str(sess.id),
+            user_id=str(current_user.id),
+            error=pa_result.error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="NFC verileri kriptografik olarak doğrulanamadı.",
+        )
+
     try:
         await repo.set_nfc_payload(
             sess,
             dg1=dg1, dg2=dg2, dg11=dg11, sod=sod,
-            passive_auth_ok=body.passive_auth_ok,
+            passive_auth_ok=server_passive_auth_ok,
         )
         await db.commit()
     except Exception as exc:
@@ -473,14 +507,16 @@ async def upload_mrtd_nfc(
         user_id=str(current_user.id),
         has_dg1=dg1 is not None, has_dg2=dg2 is not None,
         has_dg11=dg11 is not None, has_sod=sod is not None,
-        passive_auth_ok=body.passive_auth_ok,
+        client_claimed_pa=body.passive_auth_ok,
+        server_pa_ok=server_passive_auth_ok,
+        chain_verified=pa_result.chain_verified,
     )
 
     return {
         "approve_id": str(sess.id),
         "status": sess.status,
         "nfc_verified": True,
-        "passive_auth_ok": sess.passive_auth_ok,
+        "passive_auth_ok": sess.passive_auth_ok,  # = server-derived
         "expires_at": sess.expires_at.isoformat(),
     }
 
@@ -555,9 +591,35 @@ async def create_corporate_payment(
         nfc_verified=body.nfc_verified,
     )
     if mrtd_sess is not None:
-        payment.mrtd_session_id = mrtd_sess.id
+        # H-1: Atomik UPDATE/RETURNING ile race koşulu kapatıldı.
         mrtd_repo = MrtdSessionRepo(db)
-        await mrtd_repo.consume(mrtd_sess, payment_id=payment.id)
+        try:
+            await mrtd_repo.atomic_consume(
+                approve_id=mrtd_sess.id,
+                user_id=current_user.id,
+                purpose=MrtdPurpose.CORPORATE_PAYMENT,
+                payment_id=payment.id,
+            )
+        except MrtdSessionConsumeError as exc:
+            # M-3: Sessiz idempotency yerine net 409 ve rollback.
+            await db.rollback()
+            logger.warning(
+                "corporate.payment.mrtd_consume_failed",
+                approve_id=str(mrtd_sess.id),
+                user_id=str(current_user.id),
+                reason=str(exc),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "mrtd_session_consume_conflict",
+                    "message": (
+                        "MRTD oturumu artık kullanılamıyor (süresi doldu, "
+                        "başka bir işleme bağlandı veya geçersiz)."
+                    ),
+                },
+            )
+        payment.mrtd_session_id = mrtd_sess.id
     await db.commit()
 
     # Netgsm ile SMS gönder (hata olsa işlem durdurmaz)
@@ -669,7 +731,7 @@ async def verify_corporate_payment_otp(
             reference_id=idempotency_key,
             description=(
                 f"Kurumsal Ödeme | {payment.gold_type} | "
-                f"Alıcı TCKN: {payment.recipient_tckn}"
+                f"Alıcı TCKN: {mask_tckn(payment.recipient_tckn)}"  # H-6
             ),
             entries=[
                 # LIABILITY DEBIT  → kullanıcı bakiyesi azalır
@@ -812,9 +874,34 @@ async def create_corporate_receive(
         nfc_verified=body.nfc_verified,
     )
     if mrtd_sess is not None:
-        req.mrtd_session_id = mrtd_sess.id
+        # H-1: Atomik consume — race / re-use kapalı.
         mrtd_repo = MrtdSessionRepo(db)
-        await mrtd_repo.consume(mrtd_sess, receive_id=req.id)
+        try:
+            await mrtd_repo.atomic_consume(
+                approve_id=mrtd_sess.id,
+                user_id=current_user.id,
+                purpose=MrtdPurpose.CORPORATE_RECEIVE,
+                receive_id=req.id,
+            )
+        except MrtdSessionConsumeError as exc:
+            await db.rollback()
+            logger.warning(
+                "corporate.receive.mrtd_consume_failed",
+                approve_id=str(mrtd_sess.id),
+                user_id=str(current_user.id),
+                reason=str(exc),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "mrtd_session_consume_conflict",
+                    "message": (
+                        "MRTD oturumu artık kullanılamıyor (süresi doldu, "
+                        "başka bir işleme bağlandı veya geçersiz)."
+                    ),
+                },
+            )
+        req.mrtd_session_id = mrtd_sess.id
     await db.commit()
 
     # Tutarı Türkçe formatlı gönder  (1234.50 → "1.234,50")

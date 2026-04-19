@@ -95,21 +95,26 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         _apply_standard_headers(response, self.settings, path=path)
 
         # ── [B] Bilgi Sızıntısı Önleme ─────────────────────────────────────
-        _remove_disclosure_headers(response)
+        _remove_disclosure_headers(response, self.settings)
 
         # ── [C] X-Pentora-Signature ─────────────────────────────────────────
         _apply_pentora_signature(response, request, body)
 
-        # ── [D] X-Pentora-SQL ───────────────────────────────────────────────
-        response.headers["X-Pentora-SQL"] = sql_scan_result.to_header_value()
+        # M-12 (Information Disclosure):
+        # X-Pentora-SQL / X-Pentora-GRAuth / X-Response-Time iç durumu sızdırır
+        # (saldırgan SQL guard'ın değerini, oturum durumunu ve yanıt süresini
+        # zamanlama saldırılarında kullanabilir). Üretimde GİZLENİR; sadece
+        # dev/staging'de geliştirici görünürlüğü için açık tutulur.
+        if not self.settings.is_production:
+            # ── [D] X-Pentora-SQL (sadece dev/staging) ─────────────────────
+            response.headers["X-Pentora-SQL"] = sql_scan_result.to_header_value()
+            # ── [E] X-Pentora-GRAuth (sadece dev/staging) ───────────────────
+            _apply_pentora_grauth(response, request)
+            response.headers["X-Response-Time"] = f"{elapsed_ms}ms"
 
-        # ── [E] X-Pentora-GRAuth ────────────────────────────────────────────
-        _apply_pentora_grauth(response, request)
-
-        # ── [F] İzlenebilirlik ──────────────────────────────────────────────
+        # ── [F] İzlenebilirlik (request_id her ortamda — destek için gerekli) ─
         request_id = request.state.__dict__.get("request_id", "n/a")
         response.headers["X-Request-ID"] = request_id
-        response.headers["X-Response-Time"] = f"{elapsed_ms}ms"
 
         # ── [G] M-3: Yanıt gövdesi HMAC (session_key ile MITM koruması) ────
         await _apply_response_hmac(response, request)
@@ -222,19 +227,21 @@ def _apply_standard_headers(response: Response, settings, path: str = "") -> Non
 # [B] Bilgi Sızıntısı Önleme
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _remove_disclosure_headers(response: Response) -> None:
+def _remove_disclosure_headers(response: Response, settings) -> None:
     """
     Sunucu teknolojisi hakkında bilgi sızdıran header'ları kaldırır.
     OWASP A05: Security Misconfiguration — Information Leakage
     ISO 27001 A.14.2: System Security in Development and Support
+
+    L-9: Üretimde "Server" değeri tamamen generic ("server") yapılır;
+    geliştirme ortamında "GuvenlIOdeme" debug için tutulur.
     """
     for header in ("Server", "X-Powered-By", "X-AspNet-Version",
                    "X-AspNetMvc-Version", "Via"):
         if header in response.headers:
             del response.headers[header]
 
-    # Sunucu bilgisini genel bir değerle maskele
-    response.headers["Server"] = "GuvenlIOdeme"
+    response.headers["Server"] = "server" if settings.is_production else "GuvenlIOdeme"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,8 +305,11 @@ def _perform_sql_scan(request: Request, body: bytes) -> object:
     # Sadece path+query tara; body sadece JSON/text için taranır
     scan_target_parts = [path, str(request.url.query)]
 
-    # Binary olmayan body'leri de tara
-    if body:
+    # M-4: Handshake gibi false-positive üreten body'leri atla; path+query yine taranır.
+    from app.core.security import is_sql_body_skipped
+    skip_body = is_sql_body_skipped(path)
+
+    if body and not skip_body:
         content_type = request.headers.get("content-type", "").lower()
         is_binary = (
             "multipart" in content_type

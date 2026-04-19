@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.masking import mask_tckn  # H-6: PII maskeleme
 from app.db.dependencies import get_db
 from app.models.accounting import AccountType, JournalDirection
 from app.models.corporate_receive_request import CorporateReceiveStatus
@@ -105,6 +106,34 @@ async def paytr_callback(
         logger.info("paytr.webhook.already_processed", receive_id=str(receive_id))
         return {"status": "OK"}
 
+    # ── H-5: Tutar Mutabakat Kontrolü ─────────────────────────────────────
+    # PayTR webhook'u kuruş cinsinden `total_amount` gönderir (örn. 12345 → 123.45 TL).
+    # İstemcinin spoof edebileceği veya farklı tutarda gelebilen ödemeyi tespit
+    # etmek için DB'deki beklenen tutarla 0.01 TL toleransla karşılaştırırız.
+    # Eşleşmezse hesaba YAZILMAZ; manuel müdahale için audit log üretilir.
+    try:
+        paid_kurus = int(total_amount)
+    except (TypeError, ValueError):
+        logger.warning(
+            "paytr.webhook.invalid_amount_format",
+            merchant_oid=merchant_oid, total_amount=total_amount,
+        )
+        return {"status": "OK"}
+
+    expected_kurus = int((Decimal(req.amount) * Decimal("100")).to_integral_value())
+    # 1 kuruşluk yuvarlama farkına izin ver (PayTR rounding)
+    if abs(paid_kurus - expected_kurus) > 1:
+        logger.error(
+            "paytr.webhook.amount_mismatch",
+            merchant_oid=merchant_oid,
+            receive_id=str(receive_id),
+            expected_kurus=expected_kurus,
+            paid_kurus=paid_kurus,
+        )
+        # PayTR'ye yine OK yaz (callback retry'larını engellemek için) ama
+        # hesabı KESİNLİKLE etkileme. Operasyon ekibi alarmı manuel inceler.
+        return {"status": "OK"}
+
     # ── Escrow'a Al (Çift Taraflı Kayıt) ───────────────────────────────────
     acc_repo = AccountingRepository(db)
 
@@ -129,7 +158,8 @@ async def paytr_callback(
     try:
         await acc_repo.record_transaction(
             reference_id=idempotency_key,
-            description=f"PayTR Tahsilat | Alıcı TCKN: {req.recipient_tckn} | {req.gold_type}",
+            # H-6: TCKN düz metin yerine maske kullanılır.
+            description=f"PayTR Tahsilat | Alıcı TCKN: {mask_tckn(req.recipient_tckn)} | {req.gold_type}",
             entries=[
                 # ASSET DEBIT → sistem nakit aldı
                 {"account_id": system_paytr.id, "direction": JournalDirection.DEBIT, "amount": amount},
@@ -210,9 +240,12 @@ async def netgsm_sms_reply(
     if not req:
         req = await receive_repo.get_pending_approval_by_phone(clean_no_local)
     if not req:
-        logger.info(
-            "netgsm.sms_reply.no_pending_request",
+        # M-10: 0 eşleşme veya birden fazla bekleyen → güvensiz eşleşme;
+        # repo None döner. Manuel onay (ödeme portalı) yönlendirmesi yapılır.
+        logger.warning(
+            "netgsm.sms_reply.no_unique_match",
             no_suffix=no[-4:],
+            note="zero_or_multiple_pending",
         )
         return {"status": "no_match"}
 
@@ -237,7 +270,7 @@ async def netgsm_sms_reply(
             reference_id=idempotency_key,
             description=(
                 f"ONAYLIYORUM Transferi | {req.gold_type} | "
-                f"Alıcı TCKN: {req.recipient_tckn}"
+                f"Alıcı TCKN: {mask_tckn(req.recipient_tckn)}"  # H-6
             ),
             entries=[
                 # Escrow DEBIT (LIABILITY) → escrow azalır

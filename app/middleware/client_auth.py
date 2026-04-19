@@ -130,16 +130,29 @@ class ClientAuthMiddleware(BaseHTTPMiddleware):
             return _reject(request, "timestamp_stale",
                            "İstek süresi dolmuş veya tekrar saldırısı")
 
-        # ── Katman 5: HMAC-SHA256 İmza ───────────────────────────────────────
+        # ── Katman 5: HMAC-SHA256 İmza (M-16: nonce + body hash) ─────────────
         client_sig = request.headers.get("X-Pentora-Client-Sig", "")
         if not client_sig:
             return _reject(request, "missing_signature", "İmza eksik")
+
+        # M-16: nonce + body_sha256 imzaya dahil edilir. Eski istemciler nonce
+        # göndermez → geriye dönük uyumluluk için "legacy mode"a düşeriz
+        # (nonce="", body=None). Yeni istemciler her POST için body hash gönderir.
+        nonce = request.headers.get("X-Pentora-Client-Nonce", "")
+        body_bytes: bytes | None = None
+        if nonce:
+            try:
+                body_bytes = await request.body()
+            except Exception:
+                body_bytes = b""
 
         expected = compute_request_sig(
             handshake_id=handshake_id,
             timestamp=client_ts,
             path=request.url.path,
             session_key=session_key,
+            nonce=nonce,
+            body=body_bytes,
         )
 
         import hmac

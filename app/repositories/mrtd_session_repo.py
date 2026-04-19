@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.encryption import build_aad, decrypt_blob, encrypt_blob, hmac_index
@@ -20,6 +20,10 @@ from app.models.mrtd_session import MrtdPurpose, MrtdSession, MrtdStatus
 
 # approve_id TTL — OWASP A01 zorunluluğu: dar zaman penceresi
 SESSION_TTL_MINUTES = 15
+
+
+class MrtdSessionConsumeError(Exception):
+    """approve_id atomik olarak rezerve edilemedi (race veya zaten consumed)."""
 
 
 class MrtdSessionRepo:
@@ -117,27 +121,66 @@ class MrtdSessionRepo:
             sess.status = MrtdStatus.FAILED
         await self._s.flush()
 
-    # ── CONSUME: payment/receive bağlandı ──────────────────────────────────
-    async def consume(
+    # ── CONSUME: payment/receive bağlandı (ATOMİK) ────────────────────────
+    async def atomic_consume(
         self,
-        sess: MrtdSession,
         *,
+        approve_id: uuid.UUID,
+        user_id: uuid.UUID,
+        purpose: MrtdPurpose,
         payment_id: Optional[uuid.UUID] = None,
         receive_id: Optional[uuid.UUID] = None,
-    ) -> None:
+    ) -> MrtdSession:
         """
-        Oturumu tek-kullanımlık olarak kapatır ve ilişkili kaynağa bağlar.
-        İkinci çağrı idempotent değildir: zaten CONSUMED ise hata yükseltmez.
+        H-1 (race fix) + M-3 (silent idempotency).
+
+        Oturumu *tek* SQL UPDATE ile rezerve eder:
+            UPDATE mrtd_sessions
+            SET status='CONSUMED', consumed_at=now(),
+                linked_payment_id=..., linked_receive_id=...
+            WHERE id=:approve AND user_id=:user AND purpose=:purpose
+              AND status='NFC_DONE' AND expires_at > now()
+            RETURNING *
+
+        Neden:
+          - Eski `select-then-update` patterninde iki paralel istek aynı
+            approve_id'yi sırayla okur, ikisi de "NFC_DONE" görür ve ödeme
+            oluşturup SMS gönderir. UPDATE/RETURNING + WHERE status=NFC_DONE
+            ile yalnızca bir transaction kazanır; diğeri 0 satır döndürür ve
+            `MrtdSessionConsumeError` fırlatır.
+
+        Raises:
+            MrtdSessionConsumeError: approve_id geçersiz, başkasına ait,
+                süresi dolmuş veya zaten tüketilmiş.
         """
-        if sess.status == MrtdStatus.CONSUMED:
-            return
-        sess.status = MrtdStatus.CONSUMED
-        sess.consumed_at = datetime.now(timezone.utc)
-        if payment_id:
-            sess.linked_payment_id = payment_id
-        if receive_id:
-            sess.linked_receive_id = receive_id
+        stmt = (
+            update(MrtdSession)
+            .where(
+                MrtdSession.id == approve_id,
+                MrtdSession.user_id == user_id,
+                MrtdSession.purpose == purpose.value,
+                MrtdSession.status == MrtdStatus.NFC_DONE,
+                MrtdSession.expires_at > func.now(),
+            )
+            .values(
+                status=MrtdStatus.CONSUMED,
+                consumed_at=datetime.now(timezone.utc),
+                linked_payment_id=payment_id,
+                linked_receive_id=receive_id,
+            )
+            .returning(MrtdSession)
+            .execution_options(synchronize_session=False)
+        )
+
+        result = await self._s.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            raise MrtdSessionConsumeError(
+                "approve_id rezerve edilemedi: süresi dolmuş, başka bir işlem "
+                "tarafından kullanılmış veya geçersiz."
+            )
         await self._s.flush()
+        return row
 
     # ── DECRYPT yardımcı (iç kullanım) ─────────────────────────────────────
     @staticmethod

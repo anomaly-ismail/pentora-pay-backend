@@ -73,7 +73,14 @@ class CorporateReceiveRepo:
     ) -> Optional[CorporateReceiveRequest]:
         """
         ONAYLIYORUM SMS'i eşleştirmek için gönderen telefona göre arar.
-        Birden fazla açık talep varsa en yenisini döner.
+
+        M-10 (Ambiguous SMS reply):
+        Aynı telefonda birden fazla bekleyen onay varsa **eşleşme YAPILMAZ**
+        (None döner). Aksi halde "yanlış kayıt onaylanması" riski oluşur:
+        kullanıcı son işlemini onayladığını sanırken aslında başka bir
+        bekleyen talep kapatılıyor olabilir. Çağıran tarafta None alınınca
+        kullanıcıya manuel onay (örn. ödeme portalı butonu) yönlendirilir
+        ve audit log'a "ambiguous_sms_match" yazılır.
         """
         result = await self._session.execute(
             select(CorporateReceiveRequest)
@@ -82,10 +89,14 @@ class CorporateReceiveRepo:
                 CorporateReceiveRequest.status == CorporateReceiveStatus.PENDING_APPROVAL,
             )
             .order_by(CorporateReceiveRequest.created_at.desc())
-            .limit(1)
+            .limit(2)             # M-10: Belirsizliği yakalamak için 2 çekilir.
             .with_for_update()
         )
-        return result.scalar_one_or_none()
+        rows = result.scalars().all()
+        if len(rows) != 1:
+            # 0 → eşleşme yok; 2+ → birden fazla bekleyen onay → güvensiz eşleşme.
+            return None
+        return rows[0]
 
     async def mark_payment_received(
         self, req: CorporateReceiveRequest, paytr_oid: str

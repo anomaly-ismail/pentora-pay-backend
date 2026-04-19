@@ -80,16 +80,26 @@ _SQL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bsleep\s*\("),
 )
 
-_SQL_BYPASS_PATH_PREFIXES: tuple[str, ...] = (
-    "/api/v1/auth/handshake",
+# M-4: Defense-in-depth.
+# `BODY_SKIP` listesi yalnızca *body* taramasını atlar; path+query yine taranır.
+# `FULL_BYPASS` listesi tüm taramayı atlar (sadece sağlık/probe uçları).
+_SQL_BODY_SKIP_PREFIXES: tuple[str, ...] = (
+    "/api/v1/auth/handshake",   # Body: ECDH public key + base64 signature → false-positive riski
+)
+_SQL_FULL_BYPASS_PREFIXES: tuple[str, ...] = (
     "/health",
     "/ping",
 )
 
 
 def is_sql_injection_bypassed(path: str) -> bool:
-    """Performans/kritik path'ler için SQL heuristics taramayı bypass eder."""
-    return any(path.startswith(prefix) for prefix in _SQL_BYPASS_PATH_PREFIXES)
+    """Sadece sağlık endpoint'leri için tam bypass."""
+    return any(path.startswith(prefix) for prefix in _SQL_FULL_BYPASS_PREFIXES)
+
+
+def is_sql_body_skipped(path: str) -> bool:
+    """Body taramasının atlanması gereken (false-positive üreten) endpointler."""
+    return any(path.startswith(prefix) for prefix in _SQL_BODY_SKIP_PREFIXES)
 
 
 def scan_for_sql_injection(content: str, path: str = "") -> SQLScanResult:

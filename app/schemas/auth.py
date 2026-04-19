@@ -93,8 +93,13 @@ class RegisterRequest(BaseModel):
     def validate_nfc_uid(cls, v: str) -> str:
         if v == "":
             return v  # NFC atlandı — boş string geçerli
-        if not re.fullmatch(r"[0-9A-Fa-f]+", v):
-            raise ValueError("NFC UID geçerli bir HEX string olmalıdır (örn: 08578561)")
+        # C-1: Magic-string atlatması yasak (tarihte "MRTD_BAC_VERIFIED_TCKN"
+        # gibi placeholder kullanan istemciler vardı). Yalnızca [0-9A-F]
+        # ve gerçekçi uzunlukta UID'ler kabul edilir (4–16 byte → 8–32 hex).
+        if not re.fullmatch(r"[0-9A-Fa-f]{8,32}", v):
+            raise ValueError(
+                "NFC UID geçerli bir HEX string olmalıdır (8–32 karakter, sadece 0-9A-F)."
+            )
         return v.upper()
 
 

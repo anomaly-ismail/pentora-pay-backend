@@ -1,3 +1,5 @@
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -94,44 +96,151 @@ async def get_transactions(
     if not account_ids:
         return TransactionsListResponse(transactions=[])
 
-    # JournalEntry + Transaction tek sorguda — JOIN ile N+1 önlenir
-    stmt_entries = (
-        select(JournalEntry)
-        .options(selectinload(JournalEntry.transaction))
+    # 0) Escrow FIFO Netleştirme:
+    #    "Pending" (bekleyen) bir işlem, escrow'da hâlâ tutulan parayı temsil
+    #    eder. Sistem genelde iki ayrı `Transaction` üretir:
+    #      • Tahsilat (CREDIT escrow)
+    #      • Müşteri onayı (DEBIT escrow + CREDIT ana cüzdan)
+    #    Onay sonrası tahsilat işlemi de hâlâ defterde durur ama netleşmiştir.
+    #    Bu yüzden escrow geçmişini zaman sırasına göre tarayıp her DEBIT'i en
+    #    eski açık CREDIT'le eşleştiriyoruz. Geriye kalan açık CREDIT'lerin
+    #    transaction_id'leri, gerçekten henüz netleşmemiş "bekleyen" işlemlerdir.
+    unsettled_pending_tx_ids: set = set()
+    if escrow_id is not None:
+        stmt_escrow = (
+            select(JournalEntry)
+            .where(JournalEntry.account_id == escrow_id)
+            .order_by(JournalEntry.created_at.asc(), JournalEntry.id.asc())
+        )
+        escrow_history = (await db.execute(stmt_escrow)).scalars().all()
+
+        open_credits: list = []  # FIFO kuyruğu — açık CREDIT'ler
+        for e in escrow_history:
+            if e.direction == JournalDirection.CREDIT:
+                open_credits.append(e)
+            else:  # DEBIT — en eski açık CREDIT'i kapat
+                if open_credits:
+                    open_credits.pop(0)
+
+        unsettled_pending_tx_ids = {e.transaction_id for e in open_credits}
+
+    # 1) Benzersiz transaction_id'leri zaman sırasına göre sayfala.
+    #    Çift-kayıt muhasebesinde her işlem 2 JournalEntry üretir (ana cüzdan
+    #    + escrow). Sayfa başına transaction göstermek için entry bazında değil
+    #    transaction bazında `LIMIT/OFFSET` uygulanmalı. Aksi hâlde her işlem
+    #    hem "Gelen/Giden" hem "Bekleyen" sekmesinde iki kere görünür.
+    stmt_tx_ids = (
+        select(
+            JournalEntry.transaction_id,
+            func.max(JournalEntry.created_at).label("last_at"),
+        )
         .where(JournalEntry.account_id.in_(account_ids))
-        .order_by(JournalEntry.created_at.desc())
+        .group_by(JournalEntry.transaction_id)
+        .order_by(func.max(JournalEntry.created_at).desc())
         .limit(limit)
         .offset(offset)
     )
+    tx_id_rows = (await db.execute(stmt_tx_ids)).all()
+    if not tx_id_rows:
+        return TransactionsListResponse(transactions=[])
+    tx_ids = [r.transaction_id for r in tx_id_rows]
+    tx_order = {tx_id: idx for idx, tx_id in enumerate(tx_ids)}
+
+    # 2) Bu transaction'ların kullanıcıya ait TÜM entries'lerini tek seferde çek.
+    #    Escrow + ana cüzdan leg'leri birlikte gelir; pending/settled kararı
+    #    bu leg'lerin birleşimine bakarak verilir.
+    stmt_entries = (
+        select(JournalEntry)
+        .options(selectinload(JournalEntry.transaction))
+        .where(
+            JournalEntry.transaction_id.in_(tx_ids),
+            JournalEntry.account_id.in_(account_ids),
+        )
+    )
     entries = (await db.execute(stmt_entries)).scalars().all()
 
-    items = []
-    for entry in entries:
-        tx: Transaction = entry.transaction
-        is_pending = entry.account_id == escrow_id
-        is_incoming = None if is_pending else (entry.direction == JournalDirection.CREDIT)
+    # 3) Transaction bazında grupla.
+    from collections import defaultdict
+    tx_entries: dict = defaultdict(list)
+    for e in entries:
+        tx_entries[e.transaction_id].append(e)
 
-        amt_str = f"₺{float(entry.amount):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    items: list[TransactionItem] = []
+    for tx_id, entry_list in tx_entries.items():
+        tx: Transaction = entry_list[0].transaction
+
+        main_entry = next(
+            (e for e in entry_list if e.account_id != escrow_id), None
+        )
+        escrow_entries = [e for e in entry_list if e.account_id == escrow_id]
+
+        is_truly_pending = tx_id in unsettled_pending_tx_ids
+
+        if main_entry is not None and not is_truly_pending:
+            # Ana cüzdanda hareket var ve escrow'da açık CREDIT yok →
+            # işlem netleşmiş (tamamlanmış).
+            is_pending = False
+            is_incoming = main_entry.direction == JournalDirection.CREDIT
+            primary_entry = main_entry
+        elif is_truly_pending:
+            # Escrow'da hâlâ açık CREDIT var → gerçekten "bekleyen" işlem.
+            is_pending = True
+            is_incoming = None
+            # Tutarı escrow CREDIT entry'sinden al (kullanıcıya bekleyen miktarı
+            # bu yansıtır).
+            primary_entry = next(
+                (e for e in escrow_entries if e.direction == JournalDirection.CREDIT),
+                escrow_entries[0] if escrow_entries else (main_entry or entry_list[0]),
+            )
+        elif main_entry is not None:
+            # Sadece ana cüzdan hareketi var, escrow yok / netleşmiş → tamamlanmış.
+            is_pending = False
+            is_incoming = main_entry.direction == JournalDirection.CREDIT
+            primary_entry = main_entry
+        else:
+            # Sadece escrow leg'i var ve FIFO ile netleşmiş — kullanıcıya
+            # gösterilecek anlamlı bir görünüm yok, atla.
+            continue
+
+        amt_value = float(primary_entry.amount)
+        amt_str = (
+            f"₺{amt_value:,.2f}"
+            .replace(",", "X").replace(".", ",").replace("X", ".")
+        )
 
         if is_pending:
             status_code = 3
+            status_text = "Bekliyor"
         elif is_incoming:
             status_code = 1
+            status_text = "Tamamlandı"
         else:
             status_code = 2
+            status_text = "Tamamlandı"
 
-        items.append(TransactionItem(
-            id=str(tx.id),
-            name="Sistem İşlemi" if is_incoming else "Ödeme Transferi",
-            tckn="Ağ İşlemi",
-            amount=("+ " if is_incoming else "- ") + amt_str,
-            date=entry.created_at.strftime("%d.%m.%Y %H:%M"),
-            status="Tamamlandı" if not is_pending else "Bekliyor",
-            status_code=status_code,
-            description=tx.description,
-            ref=tx.reference_id or str(tx.id)[:8].upper(),
-            is_incoming=is_incoming,
-            is_pending=is_pending,
-        ))
+        items.append(
+            TransactionItem(
+                id=str(tx.id),
+                name=(
+                    "Sistem İşlemi" if is_incoming
+                    else ("Bekleyen İşlem" if is_pending else "Ödeme Transferi")
+                ),
+                tckn="Ağ İşlemi",
+                amount=(
+                    ("+ " if is_incoming else ("" if is_pending else "- "))
+                    + amt_str
+                ),
+                date=primary_entry.created_at.strftime("%d.%m.%Y %H:%M"),
+                status=status_text,
+                status_code=status_code,
+                description=tx.description,
+                ref=tx.reference_id or str(tx.id)[:8].upper(),
+                is_incoming=is_incoming,
+                is_pending=is_pending,
+            )
+        )
+
+    # 4) İlk sorgudaki sıralamayı koru (zaman sırası).
+    items.sort(key=lambda it: tx_order.get(uuid.UUID(it.id), 0))
 
     return TransactionsListResponse(transactions=items)

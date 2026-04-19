@@ -7,9 +7,12 @@ class AdminLoginRequest(BaseModel):
 
 
 class AdminLoginResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
+    """
+    H-12: Admin JWT artık YALNIZCA HttpOnly cookie ile döner.
+    Body'de access_token YOK — XSS ile token çalınamaz.
+    """
     expires_in: int
+    success: bool = True
 
 
 class AdminLogoutResponse(BaseModel):

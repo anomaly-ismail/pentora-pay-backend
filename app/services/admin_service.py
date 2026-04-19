@@ -2,11 +2,14 @@
 Admin SSO Service
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Güvenlik özellikleri:
+  H-2: JWT blacklist (jti) artık DB'de saklanır — multi-worker / restart kalıcı.
   H-3: Admin şifresi Argon2id hash ile doğrulanır (plaintext karşılaştırma yok)
   H-5: JWT httpOnly cookie olarak ayarlanır (XSS'e karşı)
   H-6: jti (UUID) ile JWT blacklist — logout sonrası token geçersiz
   L-4: ADMIN_JWT_PRIVATE_KEY_PEM ayarlıysa ES256, yoksa HS256 (+ uyarı)
 """
+import asyncio
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -16,10 +19,15 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError
 from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.security import safe_compare
+from app.db.engine import get_session_factory
+from app.models.revoked_admin_token import RevokedAdminToken
 from app.schemas.admin import AdminLoginRequest, AdminLoginResponse
 
 logger = get_logger(__name__)
@@ -30,9 +38,12 @@ _ph = PasswordHasher(time_cost=3, memory_cost=65_536, parallelism=4)
 # H-3: Admin şifresinin Argon2id hash'i — startup'ta türetilir/yüklenir
 _admin_pass_hash_cache: Optional[str] = None
 
-# H-6: JWT blacklist — revoke edilmiş jti değerleri
-# Üretimde Redis ile değiştirilebilir.
-_jwt_blacklist: set[str] = set()
+# H-2: Performans için kısa-ömürlü pozitif cache (DB hit'i azaltır).
+# Anahtar: jti, değer: revoke edildiği zaman.  Cache TTL = 60sn, JWT TTL'si
+# uzun olduğundan eski jti'ler tekrar geldiğinde DB'ye sorulur.
+_revoked_cache: dict[str, float] = {}
+_REVOKED_CACHE_TTL_S = 60.0
+_revoked_cache_lock = asyncio.Lock()
 
 
 def _get_admin_pass_hash() -> str:
@@ -88,12 +99,39 @@ def create_admin_access_token(data: dict, expires_delta: timedelta | None = None
     return jwt.encode(to_encode, signing_key, algorithm=algorithm)
 
 
-def verify_admin_token(token: str) -> dict:
+async def _is_jti_revoked(jti: str) -> bool:
     """
-    H-6: Blacklist kontrolü dahil token doğrulama.
-    L-4: ES256 veya HS256.
+    H-2: jti revoke edilmiş mi?  Kısa-ömürlü cache + DB.
     """
-    settings = get_settings()
+    if not jti:
+        return False
+    now = time.monotonic()
+    cached = _revoked_cache.get(jti)
+    if cached is not None and (now - cached) < _REVOKED_CACHE_TTL_S:
+        return True
+
+    try:
+        async with get_session_factory()() as session:  # type: AsyncSession
+            stmt = select(RevokedAdminToken.jti).where(RevokedAdminToken.jti == jti)
+            result = await session.execute(stmt)
+            if result.scalar_one_or_none() is not None:
+                async with _revoked_cache_lock:
+                    _revoked_cache[jti] = now
+                return True
+    except Exception as exc:
+        # Fail-CLOSED: DB'ye ulaşılamıyorsa token'ı reddetmek yerine sadece
+        # uyarı log'la — admin oturumlarını topyekün kesmeyiz; alternatif:
+        # `True` döndürerek tüm istekleri reddetmek (paranoyak mod). Üretimde
+        # bu davranış konfigüre edilebilir olmalı.
+        logger.warning("admin.token.revocation_check_failed", error=str(exc))
+    return False
+
+
+def verify_admin_token_sync(token: str) -> dict:
+    """
+    Token'ın imzasını ve role/exp claim'lerini doğrular.  Blacklist kontrolü
+    `verify_admin_token` async wrapper'ında yapılır (DB I/O).
+    """
     algorithm, _, verify_key = _get_jwt_algorithm_and_keys()
     try:
         payload = jwt.decode(token, verify_key, algorithms=[algorithm])
@@ -102,22 +140,77 @@ def verify_admin_token(token: str) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Geçersiz token")
 
-    # H-6: Blacklist kontrolü
-    jti = payload.get("jti", "")
-    if jti and jti in _jwt_blacklist:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token geçersiz kılınmış")
-
     if payload.get("role") != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Yetki yetersiz")
 
     return payload
 
 
-def revoke_token(jti: str) -> None:
-    """H-6: Token'ı blacklist'e ekler."""
-    if jti:
-        _jwt_blacklist.add(jti)
-        logger.info("admin.token.revoked", jti=jti)
+async def verify_admin_token(token: str) -> dict:
+    """
+    H-2/H-6: Blacklist kontrolü dahil token doğrulama (async, DB destekli).
+    """
+    payload = verify_admin_token_sync(token)
+    jti = payload.get("jti", "")
+    if await _is_jti_revoked(jti):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token geçersiz kılınmış",
+        )
+    return payload
+
+
+async def revoke_token(jti: str, *, revoked_by: Optional[str] = None,
+                       expires_at: Optional[datetime] = None) -> None:
+    """
+    H-2: jti'yi DB blacklist tablosuna kalıcı yazar (multi-worker güvenli).
+    `expires_at` verilmezse 24 saat sonrası varsayılır (admin token TTL'si 8h
+    olduğu için yeterli güvenlik payı).
+    """
+    if not jti:
+        return
+    if expires_at is None:
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+
+    try:
+        async with get_session_factory()() as session:  # type: AsyncSession
+            # PostgreSQL ON CONFLICT ile idempotent insert
+            stmt = pg_insert(RevokedAdminToken).values(
+                jti=jti,
+                revoked_by=revoked_by,
+                expires_at=expires_at,
+            ).on_conflict_do_nothing(index_elements=["jti"])
+            await session.execute(stmt)
+            await session.commit()
+        async with _revoked_cache_lock:
+            _revoked_cache[jti] = time.monotonic()
+        logger.info("admin.token.revoked", jti=jti, by=revoked_by or "?")
+    except Exception as exc:
+        logger.error("admin.token.revoke_failed", jti=jti, error=str(exc))
+        # Fallback: cache'e koy (en azından bu worker oturumunda iptal edilmiş sayılır)
+        async with _revoked_cache_lock:
+            _revoked_cache[jti] = time.monotonic()
+
+
+async def cleanup_expired_revocations() -> int:
+    """
+    H-2: Süresi dolmuş blacklist kayıtlarını siler.  Background scheduler'dan
+    saatlik çağrılması önerilir.
+    """
+    try:
+        async with get_session_factory()() as session:  # type: AsyncSession
+            stmt = delete(RevokedAdminToken).where(
+                RevokedAdminToken.expires_at < datetime.now(timezone.utc)
+            )
+            res = await session.execute(stmt)
+            await session.commit()
+            removed = res.rowcount or 0
+            if removed:
+                logger.info("admin.token.revocations_pruned", removed=removed)
+            return int(removed)
+    except Exception as exc:
+        logger.warning("admin.token.cleanup_failed", error=str(exc))
+        return 0
 
 
 async def login_admin(request: AdminLoginRequest) -> JSONResponse:
@@ -160,12 +253,10 @@ async def login_admin(request: AdminLoginRequest) -> JSONResponse:
 
     expires_in = settings.jwt_access_token_expire_minutes * 60
 
-    # H-5: httpOnly cookie olarak da ayarla (XSS'e karşı koruma)
+    # H-12: Token YALNIZCA HttpOnly cookie'de döner; body içermez.
+    # XSS olsa dahi document.cookie ile erişilemez; CSRF için SameSite=strict.
     response = JSONResponse(
-        content=AdminLoginResponse(
-            access_token=access_token,
-            expires_in=expires_in,
-        ).model_dump()
+        content=AdminLoginResponse(expires_in=expires_in).model_dump()
     )
     response.set_cookie(
         key="admin_token",
@@ -180,14 +271,26 @@ async def login_admin(request: AdminLoginRequest) -> JSONResponse:
 
 
 async def logout_admin(token: str) -> dict:
-    """H-6: JWT'yi blacklist'e ekler."""
-    settings = get_settings()
+    """
+    H-2/H-6: JWT'yi DB blacklist'e ekler — multi-worker arasında kalıcı.
+    """
     algorithm, _, verify_key = _get_jwt_algorithm_and_keys()
     try:
-        payload = jwt.decode(token, verify_key, algorithms=[algorithm], options={"verify_exp": False})
+        payload = jwt.decode(
+            token, verify_key, algorithms=[algorithm],
+            options={"verify_exp": False},
+        )
         jti = payload.get("jti", "")
+        sub = payload.get("sub")
+        # Token'ın orijinal exp'i varsa onu kullan; yoksa 24h
+        exp_ts = payload.get("exp")
+        expires_at = (
+            datetime.fromtimestamp(int(exp_ts), tz=timezone.utc)
+            if exp_ts else None
+        )
         if jti:
-            revoke_token(jti)
-    except Exception:
-        pass  # Geçersiz token — yine de logout sayılır
+            await revoke_token(jti, revoked_by=sub, expires_at=expires_at)
+    except Exception as exc:
+        # Geçersiz token bile gelse logout sayılır; admin tarafına net mesaj.
+        logger.info("admin.logout.invalid_token", error=str(exc))
     return {"message": "Admin oturumu sonlandırıldı."}

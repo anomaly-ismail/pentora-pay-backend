@@ -1,14 +1,29 @@
 FROM python:3.11-slim
 
+# L-1 (CWE-250): Konteyner non-root kullanıcı ile çalışır.
+# `pentora` kullanıcısı UID 10001 ile yaratılır; root yok.
+ARG APP_UID=10001
+ARG APP_GID=10001
+
 WORKDIR /app
 
 # Sistem bağımlılıkları (psycopg2 vb. için)
-RUN apt-get update && apt-get install -y libpq-dev gcc && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpq-dev gcc \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid ${APP_GID} pentora \
+ && useradd  --system --uid ${APP_UID} --gid pentora --home-dir /app --shell /usr/sbin/nologin pentora
 
-COPY requirements.txt .
+COPY --chown=pentora:pentora requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY --chown=pentora:pentora . .
 
-# Backend 8080'de kalksın (Cloudflare destekler)
+# /app içeriğini sadece okuma + binlik sahip yap (defense-in-depth)
+RUN chmod -R go-w /app
+
+USER pentora:pentora
+
+# Backend 8080'de kalksın (Cloudflare Tunnel destekler)
+EXPOSE 8080
 CMD ["python", "run.py"]

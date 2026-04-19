@@ -208,6 +208,7 @@ async def create_all_tables() -> None:
     import app.models.corporate_payment  # noqa: F401
     import app.models.corporate_receive_request  # noqa: F401
     import app.models.mrtd_session  # noqa: F401
+    import app.models.revoked_admin_token  # noqa: F401  # H-2: kalıcı admin JWT blacklist
 
     async with get_engine().begin() as conn:
         # 1) Eksik tabloları oluştur (create_all zaten IF NOT EXISTS kullanır)

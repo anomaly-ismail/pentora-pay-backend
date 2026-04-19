@@ -3,13 +3,15 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 GET  /pay/{receive_id}          → Ödeme detay sayfası (HTML)
-POST /pay/{receive_id}/confirm  → Mock ödeme onayı (test) — escrow'a alır
+POST /pay/{receive_id}/confirm  → Mock ödeme onayı (yalnızca dev/staging)
 GET  /pay/{receive_id}/success  → Başarı sayfası
 GET  /pay/{receive_id}/fail     → Başarısız ödeme sayfası
 
-⚠️  /confirm endpoint'i yalnızca TEST/MOCK amaçlıdır.
-    Üretimde PayTR'nin kendi callback'i (/api/v1/webhooks/paytr/callback)
-    kullanılacak; bu endpoint kaldırılabilir veya feature flag ile korunabilir.
+⚠️  H-4 / M-2: `/confirm` ve `/mock-approve` MUTLAK suretle yalnızca:
+      • app_env != "production"  VE
+      • PayTR kimlikleri TANIMSIZ
+    olduğunda yanıt verir. Production'da 404 döner.
+    Bu sayede prod ortamına yanlışlıkla mock ödeme akışı düşürülemez.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import html as _html_module
@@ -17,12 +19,14 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.csrf import assert_same_origin  # M-21
 from app.core.logging import get_logger
+from app.core.masking import mask_tckn  # H-6
 from app.db.dependencies import get_db
 from app.models.accounting import AccountType, JournalDirection
 from app.models.corporate_receive_request import CorporateReceiveStatus
@@ -31,6 +35,27 @@ from app.repositories.corporate_receive_repo import CorporateReceiveRepo
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/pay", tags=["Payment Portal"])
+
+
+def _ensure_mock_endpoints_allowed() -> None:
+    """
+    H-4: Mock ödeme onayı endpoint'leri yalnızca dev/staging ortamlarında ve
+    PayTR credentials henüz tanımlı değilken çalışır. Üretimde 404 dönülür ki
+    yanlışlıkla "mock ödeme" ile prod akışı tetiklenemesin.
+    """
+    settings = get_settings()
+    is_production = settings.is_production
+    paytr_configured = bool(
+        settings.paytr_merchant_id
+        and settings.paytr_merchant_key
+        and settings.paytr_merchant_salt
+    )
+    if is_production or paytr_configured:
+        # Path itself var olmamış gibi davranır (bilgi sızıntısını önler).
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not Found",
+        )
 
 # ─── HTML şablon yardımcıları ─────────────────────────────────────────────────
 
@@ -285,7 +310,12 @@ async def confirm_payment(
     - PENDING_PAYMENT → PENDING_APPROVAL
     - Tutarı kullanıcının escrow hesabına ekler
     - Gerçek PayTR'de bu işi /webhooks/paytr/callback yapar
+
+    H-4: Üretimde / PayTR credentials varken 404 döner.
+    M-21: CSRF — Origin/Referer allowlist doğrulaması.
     """
+    _ensure_mock_endpoints_allowed()
+    assert_same_origin(request)
     fail = request.query_params.get("fail") == "1"
 
     if fail:
@@ -322,7 +352,7 @@ async def confirm_payment(
     try:
         await acc_repo.record_transaction(
             reference_id=idempotency_key,
-            description=f"[MOCK] PayTR Tahsilat | {req.gold_type} | TCKN: {req.recipient_tckn}",
+            description=f"[MOCK] PayTR Tahsilat | {req.gold_type} | TCKN: {mask_tckn(req.recipient_tckn)}",
             entries=[
                 # Sistem nakit aldı (ASSET DEBIT)
                 {"account_id": system_acct.id, "direction": JournalDirection.DEBIT,  "amount": amount},
@@ -431,13 +461,13 @@ async def success_page(
 @router.post("/{receive_id}/mock-approve", include_in_schema=False)
 async def mock_approve(
     receive_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> RedirectResponse:
-    settings_obj = get_settings()
-    is_mock = not (settings_obj.paytr_merchant_id and settings_obj.paytr_merchant_key)
-    if not is_mock:
-        # Gerçek prod ortamında bu endpoint devre dışı
-        return RedirectResponse(f"/pay/{receive_id}/success", status_code=303)
+    # H-4: Üretimde / PayTR credentials varken 404. (Eski sürüm prod'da
+    # sessizce success'a yönlendiriyordu — yan etki: prod kullanıcısı yanılır.)
+    _ensure_mock_endpoints_allowed()
+    assert_same_origin(request)  # M-21
 
     repo     = CorporateReceiveRepo(db)
     acc_repo = AccountingRepository(db)
@@ -467,7 +497,7 @@ async def mock_approve(
     try:
         await acc_repo.record_transaction(
             reference_id=idempotency_key,
-            description=f"[MOCK] Müşteri Onayı | {req.gold_type} | TCKN: {req.recipient_tckn}",
+            description=f"[MOCK] Müşteri Onayı | {req.gold_type} | TCKN: {mask_tckn(req.recipient_tckn)}",
             entries=[
                 # Escrow azaldı (LIABILITY DEBIT)
                 {"account_id": escrow.id, "direction": JournalDirection.DEBIT,  "amount": amount},

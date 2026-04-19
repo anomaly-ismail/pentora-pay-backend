@@ -18,6 +18,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
+from app.core.client_ip import get_real_client_ip
 from app.core.config import get_settings
 from app.core.logging import get_logger
 
@@ -31,6 +32,15 @@ _AUTH_PATHS = frozenset({
     "/api/v1/auth/logout",
     "/api/v1/admin/sso/login",   # H-4: eskiden 100/min, şimdi auth limit (10/min)
 })
+
+# M-6 / M-11: DoS açısından özel kısıtlanması gereken endpointler.
+# Bu uçlar handshake store / SMS maliyetleri yaratır.
+_HARD_LIMIT_PATHS: dict[str, tuple[int, int]] = {
+    "/api/v1/auth/handshake": (20, 60),   # 20/dk per IP — handshake_store DoS koruması
+    "/api/v1/auth/otp/send":  (5,  300),  # 5 / 5dk — SMS bombing koruması
+    "/api/v1/auth/otp/verify": (10, 60),  # 10/dk — brute force koruması
+    "/api/v1/corporate/payment/otp": (5, 300),  # SMS bombing
+}
 
 
 def _parse_limit(limit_str: str) -> tuple[int, int]:
@@ -131,35 +141,11 @@ async def _redis_is_allowed(
         return _in_memory_counter.is_allowed(key, max_requests, window_seconds)
 
 
-# ─── H-7: Güvenilen Proxy IP Kontrolü ────────────────────────────────────────
-
-def _get_client_ip(request: Request) -> str:
-    """
-    H-7: X-Forwarded-For yalnızca güvenilen proxy'lerden kabul edilir.
-    TRUSTED_PROXY_IPS boşsa doğrudan bağlantı IP'si kullanılır.
-    """
-    settings = get_settings()
-    trusted_proxies = {
-        ip.strip()
-        for ip in settings.trusted_proxy_ips.split(",")
-        if ip.strip()
-    }
-
-    direct_ip = request.client.host if request.client else "unknown"
-
-    if trusted_proxies and direct_ip in trusted_proxies:
-        forwarded = request.headers.get("X-Forwarded-For", "")
-        if forwarded:
-            # Zincirin ilk (en soldaki) IP'si gerçek istemcidir
-            client_ip = forwarded.split(",")[0].strip()
-            if client_ip:
-                return client_ip
-
-    # Güvenilir proxy yoksa veya doğrudan bağlantıysa — TCP IP'sini kullan
-    return direct_ip
-
-
 # ─── Middleware ───────────────────────────────────────────────────────────────
+# H-3 / H-7: Güvenilen proxy IP kontrolü merkezi `app/core/client_ip.py` içinde.
+# `get_real_client_ip` Cloudflare Tunnel için CF-Connecting-IP ve XFF chain'i
+# trusted_proxy_ips listesi ışığında birlikte değerlendirir.
+
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
@@ -174,10 +160,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._auth_max, self._auth_window = _parse_limit(settings.rate_limit_auth)
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        client_ip = _get_client_ip(request)
+        # H-3 / Cloudflare Tunnel: client_ip.py XFF + CF-Connecting-IP
+        # birlikte ele alır (trusted proxy doğrulaması içinde).
+        client_ip = get_real_client_ip(request)
         path = request.url.path
 
-        if path in _AUTH_PATHS:
+        # M-6 / M-11: Hard-limited endpoints
+        hard = _HARD_LIMIT_PATHS.get(path)
+        if hard is not None:
+            max_req, window = hard
+        elif path in _AUTH_PATHS:
             max_req, window = self._auth_max, self._auth_window
         else:
             max_req, window = self._default_max, self._default_window
