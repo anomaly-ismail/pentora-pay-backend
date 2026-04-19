@@ -9,6 +9,11 @@ slowapi==0.1.9
 limits==3.14.0
 cryptography==44.0.0
 argon2-cffi==23.1.0
+
+# H-8: ICAO 9303 EF.SOD (CMS SignedData) parsing — saf Python ASN.1 parser.
+# `cryptography.pkcs7` LDS Security Object'i çıkartmaya elverişli değil;
+# asn1crypto ICAO/CMS standartlarını eksiksiz destekler.
+asn1crypto>=1.5.1
 PyJWT==2.10.1
 structlog==24.4.0
 rich==13.9.4
