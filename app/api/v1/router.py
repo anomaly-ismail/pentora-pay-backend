@@ -8,6 +8,8 @@ from app.api.v1.endpoints.corporate import flutter_router as corporate_flutter_r
 from app.api.v1.endpoints.corporate import admin_corp_router
 from app.api.v1.endpoints.employees import router as employees_router
 from app.api.v1.endpoints.webhooks import router as webhooks_router
+from app.api.v1.endpoints.admin_users import router as admin_users_router
+from app.api.v1.endpoints.chat import router as admin_chat_router
 
 router = APIRouter()
 router.include_router(auth_router)
@@ -17,6 +19,8 @@ router.include_router(notifications_router)
 router.include_router(corporate_flutter_router)
 router.include_router(admin_corp_router)
 router.include_router(employees_router)
+router.include_router(admin_users_router)
+router.include_router(admin_chat_router)
 router.include_router(webhooks_router)
 
 

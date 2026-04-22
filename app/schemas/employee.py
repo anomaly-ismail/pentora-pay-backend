@@ -85,6 +85,10 @@ class _EmployeeBase(BaseModel):
     status: Optional[EmployeeStatus] = None
     notes: Optional[str] = Field(None, max_length=2000)
 
+    # RBAC: Admin panel erişimi (süper admin tarafından atanır).
+    is_admin: Optional[bool] = None
+    admin_permissions: Optional[list[str]] = None
+
     @field_validator("tckn")
     @classmethod
     def _validate_tckn(cls, v: Optional[str]) -> Optional[str]:
@@ -163,6 +167,14 @@ class EmployeeResponse(BaseModel):
     status: EmployeeStatus
     notes: Optional[str] = None
 
+    # RBAC alanları
+    is_admin: bool = False
+    admin_user_id: Optional[str] = None
+    admin_email: Optional[str] = None
+    admin_permissions: list[str] = Field(default_factory=list)
+    # Süper admin yanıtında plaintext parola döner.
+    admin_password_plain: Optional[str] = None
+
     created_by: Optional[str] = None
     updated_by: Optional[str] = None
     created_at: datetime
@@ -186,6 +198,10 @@ class EmployeeListItem(BaseModel):
     hire_date: Optional[date] = None
     status: EmployeeStatus
     created_at: datetime
+
+    # RBAC özet alanları
+    is_admin: bool = False
+    admin_email: Optional[str] = None
 
 
 class EmployeeListResponse(BaseModel):

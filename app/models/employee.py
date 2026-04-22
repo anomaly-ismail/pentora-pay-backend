@@ -17,7 +17,7 @@ from datetime import date, datetime, timezone
 from enum import StrEnum
 from typing import Optional
 
-from sqlalchemy import Date, DateTime, Index, LargeBinary, String, Text, text
+from sqlalchemy import Boolean, Date, DateTime, Index, LargeBinary, String, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -165,6 +165,24 @@ class Employee(Base):
         Text,
         nullable=True,
         comment="Admin notları",
+    )
+
+    # ── RBAC — Admin Erişimi ────────────────────────────────────────────────
+    # True olduğunda bu çalışan için bir `admin_users` kaydı oluşturulur
+    # ve @pentorasec.com.tr'li bir e-posta + rastgele güçlü parola üretilir.
+    is_admin: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+        comment="Admin paneline erişim yetkisi",
+    )
+
+    admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+        comment="Bağlı AdminUser.id (is_admin=True olduğunda)",
     )
 
     # ── Audit ────────────────────────────────────────────────────────────────

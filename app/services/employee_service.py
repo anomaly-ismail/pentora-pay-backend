@@ -20,7 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.encryption import build_aad, decrypt_blob, encrypt_blob, hmac_index
 from app.core.logging import get_logger
+from app.models.admin_user import AdminUser
 from app.models.employee import Employee, EmployeeStatus
+from app.repositories.admin_user_repo import AdminUserRepo
 from app.repositories.employee_repo import EmployeeRepo
 from app.schemas.employee import (
     EmployeeCreate,
@@ -74,7 +76,42 @@ def _dec(blob: Optional[bytes], employee_id: uuid.UUID | str, field: str) -> Opt
 
 
 # ─── Response builder ────────────────────────────────────────────────────────
-def _to_response(emp: Employee, *, reveal_pii: bool = True) -> EmployeeResponse:
+async def _resolve_admin_info(
+    session: AsyncSession,
+    emp: Employee,
+    *,
+    reveal_password: bool = False,
+) -> tuple[Optional[str], Optional[str], list[str], Optional[str]]:
+    """(admin_user_id, admin_email, permissions, password_plain) döner."""
+    if not emp.is_admin:
+        return None, None, [], None
+    admin: Optional[AdminUser] = None
+    if emp.admin_user_id:
+        admin = await session.get(AdminUser, emp.admin_user_id)
+    if not admin:
+        admin = await AdminUserRepo(session).get_by_employee_id(emp.id)
+    if not admin:
+        return None, None, [], None
+    password_plain: Optional[str] = None
+    if reveal_password:
+        from app.services.admin_user_service import _decrypt_password  # type: ignore
+
+        password_plain = _decrypt_password(admin)
+    return (
+        str(admin.id),
+        admin.email,
+        list(admin.permissions or []),
+        password_plain,
+    )
+
+
+async def _to_response(
+    session: AsyncSession,
+    emp: Employee,
+    *,
+    reveal_pii: bool = True,
+    reveal_admin_password: bool = False,
+) -> EmployeeResponse:
     tckn = _dec(emp.tckn_encrypted, emp.id, "tckn")
     iban = _dec(emp.iban_encrypted, emp.id, "iban")
     salary_raw = _dec(emp.salary_encrypted, emp.id, "salary")
@@ -84,6 +121,10 @@ def _to_response(emp: Employee, *, reveal_pii: bool = True) -> EmployeeResponse:
             salary = Decimal(salary_raw)
         except Exception:  # noqa: BLE001
             salary = None
+
+    admin_user_id, admin_email, admin_perms, admin_pw = await _resolve_admin_info(
+        session, emp, reveal_password=reveal_admin_password
+    )
 
     return EmployeeResponse(
         id=str(emp.id),
@@ -106,6 +147,11 @@ def _to_response(emp: Employee, *, reveal_pii: bool = True) -> EmployeeResponse:
         emergency_contact_phone=emp.emergency_contact_phone,
         status=EmployeeStatus(emp.status),
         notes=emp.notes,
+        is_admin=bool(emp.is_admin),
+        admin_user_id=admin_user_id,
+        admin_email=admin_email,
+        admin_permissions=admin_perms,
+        admin_password_plain=admin_pw,
         created_by=emp.created_by,
         updated_by=emp.updated_by,
         created_at=emp.created_at,
@@ -131,28 +177,45 @@ async def list_employees(
         limit=limit,
         offset=offset,
     )
-    items = [
-        EmployeeListItem(
-            id=str(r.id),
-            employee_no=r.employee_no,
-            full_name=r.full_name,
-            email=r.email,
-            phone=r.phone,
-            department=r.department,
-            position=r.position,
-            hire_date=r.hire_date,
-            status=EmployeeStatus(r.status),
-            created_at=r.created_at,
+    # Admin e-posta bilgisi listede özet olarak gösterilsin diye tek turda çek
+    admin_repo = AdminUserRepo(session)
+    items: list[EmployeeListItem] = []
+    for r in rows:
+        admin_email: Optional[str] = None
+        if r.is_admin:
+            admin = None
+            if r.admin_user_id:
+                admin = await session.get(AdminUser, r.admin_user_id)
+            if not admin:
+                admin = await admin_repo.get_by_employee_id(r.id)
+            if admin:
+                admin_email = admin.email
+        items.append(
+            EmployeeListItem(
+                id=str(r.id),
+                employee_no=r.employee_no,
+                full_name=r.full_name,
+                email=r.email,
+                phone=r.phone,
+                department=r.department,
+                position=r.position,
+                hire_date=r.hire_date,
+                status=EmployeeStatus(r.status),
+                created_at=r.created_at,
+                is_admin=bool(r.is_admin),
+                admin_email=admin_email,
+            )
         )
-        for r in rows
-    ]
     return EmployeeListResponse(
         employees=items, total=total, limit=limit, offset=offset
     )
 
 
 async def get_employee(
-    *, session: AsyncSession, employee_id: uuid.UUID
+    *,
+    session: AsyncSession,
+    employee_id: uuid.UUID,
+    actor_is_super: bool = False,
 ) -> EmployeeResponse:
     repo = EmployeeRepo(session)
     emp = await repo.get_by_id(employee_id)
@@ -161,7 +224,9 @@ async def get_employee(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Çalışan bulunamadı",
         )
-    return _to_response(emp)
+    return await _to_response(
+        session, emp, reveal_admin_password=actor_is_super
+    )
 
 
 async def create_employee(
@@ -169,6 +234,7 @@ async def create_employee(
     session: AsyncSession,
     data: EmployeeCreate,
     actor_email: Optional[str] = None,
+    actor_is_super: bool = False,
 ) -> EmployeeResponse:
     repo = EmployeeRepo(session)
 
@@ -212,11 +278,22 @@ async def create_employee(
         emergency_contact_phone=data.emergency_contact_phone,
         status=(data.status or EmployeeStatus.ACTIVE).value,
         notes=data.notes,
+        is_admin=False,  # admin_user oluştuktan sonra True'ya çekilir
         created_by=actor_email,
         updated_by=actor_email,
     )
 
     await repo.add(emp)
+
+    # RBAC: is_admin=True istendiyse admin_user oluştur (yalnızca süper admin).
+    if data.is_admin and actor_is_super:
+        await _ensure_admin_user(
+            session,
+            emp,
+            permissions=data.admin_permissions,
+            actor_email=actor_email,
+        )
+
     await session.commit()
     await session.refresh(emp)
 
@@ -226,7 +303,9 @@ async def create_employee(
         employee_no=emp.employee_no,
         actor=actor_email,
     )
-    return _to_response(emp)
+    return await _to_response(
+        session, emp, reveal_admin_password=actor_is_super
+    )
 
 
 async def update_employee(
@@ -235,6 +314,7 @@ async def update_employee(
     employee_id: uuid.UUID,
     data: EmployeeUpdate,
     actor_email: Optional[str] = None,
+    actor_is_super: bool = False,
 ) -> EmployeeResponse:
     repo = EmployeeRepo(session)
     emp = await repo.get_by_id(employee_id)
@@ -303,6 +383,22 @@ async def update_employee(
     emp.updated_by = actor_email
     emp.updated_at = datetime.now(timezone.utc)
 
+    # RBAC — yalnızca süper admin değiştirebilir
+    if actor_is_super:
+        if data.is_admin is True and not emp.is_admin:
+            await _ensure_admin_user(
+                session,
+                emp,
+                permissions=data.admin_permissions,
+                actor_email=actor_email,
+            )
+        elif data.is_admin is False and emp.is_admin:
+            await _remove_admin_user(session, emp, actor_email=actor_email)
+        elif data.admin_permissions is not None and emp.is_admin:
+            await _update_admin_permissions(
+                session, emp, permissions=data.admin_permissions
+            )
+
     await session.commit()
     await session.refresh(emp)
 
@@ -312,7 +408,120 @@ async def update_employee(
         employee_no=emp.employee_no,
         actor=actor_email,
     )
-    return _to_response(emp)
+    return await _to_response(
+        session, emp, reveal_admin_password=actor_is_super
+    )
+
+
+# ─── RBAC yardımcıları ───────────────────────────────────────────────────────
+async def _ensure_admin_user(
+    session: AsyncSession,
+    emp: Employee,
+    *,
+    permissions: Optional[list[str]],
+    actor_email: Optional[str],
+) -> None:
+    """Çalışan için admin_users kaydı oluştur (veya varsa tekrar aktif et)."""
+    from app.services.admin_user_service import (
+        ADMIN_EMAIL_DOMAIN,
+        _encrypt_password,
+        _ph,
+        generate_password,
+        generate_unique_admin_email,
+    )
+
+    repo = AdminUserRepo(session)
+    existing = await repo.get_by_employee_id(emp.id)
+    if existing:
+        # Varsa aktifleştir + yeni parola bas
+        plaintext = generate_password()
+        existing.is_active = True
+        existing.password_hash = _ph.hash(plaintext)
+        existing.password_encrypted = _encrypt_password(existing.id, plaintext)
+        if permissions is not None:
+            from app.models.admin_user import ADMIN_PERMISSION_KEYS
+
+            existing.permissions = [
+                p for p in (permissions or []) if p in ADMIN_PERMISSION_KEYS
+            ]
+        await session.flush()
+        emp.is_admin = True
+        emp.admin_user_id = existing.id
+        return
+
+    # Yeni oluştur
+    email = await generate_unique_admin_email(session, emp.full_name)
+    new_id = uuid.uuid4()
+    plaintext = generate_password()
+    from app.models.admin_user import ADMIN_PERMISSION_KEYS
+
+    clean_perms = [p for p in (permissions or []) if p in ADMIN_PERMISSION_KEYS]
+
+    admin = AdminUser(
+        id=new_id,
+        employee_id=emp.id,
+        email=email,
+        password_hash=_ph.hash(plaintext),
+        password_encrypted=_encrypt_password(new_id, plaintext),
+        display_name=emp.full_name,
+        is_super_admin=False,
+        is_active=True,
+        permissions=clean_perms,
+        created_by=actor_email,
+    )
+    await repo.add(admin)
+    emp.is_admin = True
+    emp.admin_user_id = admin.id
+    logger.info(
+        "employee.admin_user_created",
+        employee_id=str(emp.id),
+        admin_email=email,
+        actor=actor_email,
+    )
+
+
+async def _remove_admin_user(
+    session: AsyncSession,
+    emp: Employee,
+    *,
+    actor_email: Optional[str],
+) -> None:
+    repo = AdminUserRepo(session)
+    admin: Optional[AdminUser] = None
+    if emp.admin_user_id:
+        admin = await session.get(AdminUser, emp.admin_user_id)
+    if not admin:
+        admin = await repo.get_by_employee_id(emp.id)
+    if admin and not admin.is_super_admin:
+        await repo.delete(admin)
+        logger.warning(
+            "employee.admin_user_removed",
+            employee_id=str(emp.id),
+            admin_email=admin.email,
+            actor=actor_email,
+        )
+    emp.is_admin = False
+    emp.admin_user_id = None
+
+
+async def _update_admin_permissions(
+    session: AsyncSession,
+    emp: Employee,
+    *,
+    permissions: list[str],
+) -> None:
+    from app.models.admin_user import ADMIN_PERMISSION_KEYS
+
+    admin: Optional[AdminUser] = None
+    if emp.admin_user_id:
+        admin = await session.get(AdminUser, emp.admin_user_id)
+    if not admin:
+        admin = await AdminUserRepo(session).get_by_employee_id(emp.id)
+    if admin:
+        admin.permissions = [
+            p for p in (permissions or []) if p in ADMIN_PERMISSION_KEYS
+        ]
+        await session.flush()
 
 
 async def delete_employee(
@@ -329,6 +538,15 @@ async def delete_employee(
             detail="Çalışan bulunamadı",
         )
     employee_no = emp.employee_no
+    # Bağlı admin_user varsa o da silinsin (süper admin dışı).
+    try:
+        await _remove_admin_user(session, emp, actor_email=actor_email)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "employee.delete.admin_cleanup_failed",
+            employee_id=str(emp.id),
+            error=str(exc),
+        )
     await repo.delete(emp)
     await session.commit()
     logger.warning(

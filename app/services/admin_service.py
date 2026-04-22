@@ -27,6 +27,7 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.security import safe_compare
 from app.db.engine import get_session_factory
+from app.models.admin_user import AdminUser
 from app.models.revoked_admin_token import RevokedAdminToken
 from app.schemas.admin import AdminLoginRequest, AdminLoginResponse
 
@@ -218,19 +219,27 @@ async def login_admin(request: AdminLoginRequest) -> JSONResponse:
     H-3: Argon2id verify ile şifre kontrolü.
     H-5: httpOnly cookie + response body (hibrit yaklaşım).
     OWASP: Timing attack koruması — safe_compare (email) + Argon2id (şifre).
+
+    RBAC: İki giriş yolu vardır:
+      1) Environment tabanlı süper admin (ADMIN_MAIL + ADMIN_PASS)
+         → is_super_admin=True, tüm yetkilere sahip.
+      2) admin_users tablosundaki DB admin hesapları (yeni çalışanlar için).
+
+    JWT payload her iki durumda da `sub`, `role`, `admin_user_id`,
+    `is_super_admin`, `permissions` içerir.
     """
     settings = get_settings()
 
-    # Email constant-time karşılaştırma
-    email_ok = safe_compare(request.email, settings.admin_mail)
+    # Email constant-time karşılaştırma — env'deki süper admin mi?
+    email_ok_env = safe_compare(request.email, settings.admin_mail)
 
     # H-3: Argon2id ile şifre doğrulama
-    pass_ok = False
-    if email_ok:
+    pass_ok_env = False
+    if email_ok_env:
         try:
-            pass_ok = _ph.verify(_get_admin_pass_hash(), request.password)
+            pass_ok_env = _ph.verify(_get_admin_pass_hash(), request.password)
         except (VerifyMismatchError, VerificationError):
-            pass_ok = False
+            pass_ok_env = False
     else:
         # Timing attack koruması: email yanlış olsa da aynı süreyi harca
         try:
@@ -238,7 +247,51 @@ async def login_admin(request: AdminLoginRequest) -> JSONResponse:
         except Exception:
             pass
 
-    if not email_ok or not pass_ok:
+    auth_context: dict = {}
+    if email_ok_env and pass_ok_env:
+        auth_context = {
+            "sub": request.email,
+            "admin_user_id": None,
+            "is_super_admin": True,
+            "permissions": ["*"],
+        }
+        # env admin için DB kaydı var mı? varsa last_login_at güncelle + ID bağla
+        try:
+            async with get_session_factory()() as session:  # type: AsyncSession
+                stmt = select(AdminUser).where(
+                    AdminUser.email == request.email.lower()
+                )
+                db_admin = (await session.execute(stmt)).scalar_one_or_none()
+                if db_admin:
+                    db_admin.last_login_at = datetime.now(timezone.utc)
+                    await session.commit()
+                    auth_context["admin_user_id"] = str(db_admin.id)
+                    auth_context["permissions"] = list(db_admin.permissions or []) or ["*"]
+        except Exception as exc:
+            logger.warning("admin.login.env_admin_db_touch_failed", error=str(exc))
+    else:
+        # DB tabanlı admin ara
+        try:
+            from app.services.admin_user_service import authenticate_db_admin
+
+            async with get_session_factory()() as session:  # type: AsyncSession
+                db_admin = await authenticate_db_admin(
+                    session=session, email=request.email, password=request.password
+                )
+                if db_admin:
+                    db_admin.last_login_at = datetime.now(timezone.utc)
+                    await session.commit()
+                    auth_context = {
+                        "sub": db_admin.email,
+                        "admin_user_id": str(db_admin.id),
+                        "is_super_admin": bool(db_admin.is_super_admin),
+                        "permissions": list(db_admin.permissions or [])
+                        or (["*"] if db_admin.is_super_admin else []),
+                    }
+        except Exception as exc:
+            logger.warning("admin.login.db_admin_failed", error=str(exc))
+
+    if not auth_context:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Geçersiz kimlik bilgileri",
@@ -247,7 +300,13 @@ async def login_admin(request: AdminLoginRequest) -> JSONResponse:
 
     access_token_expires = timedelta(minutes=settings.jwt_access_token_expire_minutes)
     access_token = create_admin_access_token(
-        data={"sub": request.email, "role": "admin"},
+        data={
+            "sub": auth_context["sub"],
+            "role": "admin",
+            "admin_user_id": auth_context.get("admin_user_id"),
+            "is_super_admin": auth_context.get("is_super_admin", False),
+            "permissions": auth_context.get("permissions", []),
+        },
         expires_delta=access_token_expires,
     )
 

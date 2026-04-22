@@ -61,6 +61,19 @@ def _actor_email(payload: dict) -> Optional[str]:
     return (payload or {}).get("sub") if isinstance(payload, dict) else None
 
 
+def _actor_is_super(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("is_super_admin") is True:
+        return True
+    try:
+        from app.services.admin_user_service import is_super_admin_email
+
+        return is_super_admin_email(payload.get("sub") or "")
+    except Exception:
+        return False
+
+
 # ─── List ────────────────────────────────────────────────────────────────────
 @router.get(
     "",
@@ -100,7 +113,10 @@ async def create_employee_endpoint(
     admin: dict = Depends(require_admin_jwt),
 ) -> EmployeeResponse:
     return await svc.create_employee(
-        session=db, data=payload, actor_email=_actor_email(admin)
+        session=db,
+        data=payload,
+        actor_email=_actor_email(admin),
+        actor_is_super=_actor_is_super(admin),
     )
 
 
@@ -113,9 +129,13 @@ async def create_employee_endpoint(
 async def get_employee_endpoint(
     employee_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: dict = Depends(require_admin_jwt),
+    admin: dict = Depends(require_admin_jwt),
 ) -> EmployeeResponse:
-    return await svc.get_employee(session=db, employee_id=employee_id)
+    return await svc.get_employee(
+        session=db,
+        employee_id=employee_id,
+        actor_is_super=_actor_is_super(admin),
+    )
 
 
 # ─── Update ──────────────────────────────────────────────────────────────────
@@ -135,6 +155,7 @@ async def update_employee_endpoint(
         employee_id=employee_id,
         data=payload,
         actor_email=_actor_email(admin),
+        actor_is_super=_actor_is_super(admin),
     )
 
 
